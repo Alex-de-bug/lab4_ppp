@@ -56,8 +56,7 @@ public final class BuildJob {
                                 .and(length(trim(col("player_id"))).gt(0))
                                 .and(col("season_end").isNotNull())
                                 .and(col("salary").isNotNull())
-                                .and(col("salary").gt(0))
-                                .and(col("season_end").between(1985, 2017))));
+                                .and(col("salary").gt(0))));
 
         // P6: J2 + uniqueness assert + метрика.
         Dataset<Row> joined = JoinAndMetric.join(stats, salaries).cache();
