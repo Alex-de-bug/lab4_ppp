@@ -5,12 +5,6 @@ import org.apache.spark.sql.Row;
 
 import static org.apache.spark.sql.functions.col;
 
-/**
- * repartition(season) гарантирует, что все строки сезона пишет одна задача.
- * season идёт первым в сортировке: Spark при partitionBy сам требует порядок по
- * partition-колонке и иначе добавляет собственный Sort, теряя порядок efficiency.
- * Внутри каждой партиции остаётся efficiency DESC, player_id ASC.
- */
 public final class PartitionWriter {
 
     private PartitionWriter() {

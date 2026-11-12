@@ -243,7 +243,7 @@ flowchart TB
 | # | Датасет | Ключ | Правило | Почему так | Эффект на текущих данных |
 |---|---|---|---|---|---|
 | D-1 | players | `name_norm` | `count(DISTINCT _id)`; ровно 1 → mapping, больше 1 → имя исключается целиком | в stats нет ID; выбор «наиболее вероятного» запрещён | 4 596 имён в mapping; 43 имени / 89 игроков исключены |
-| D-2 | stats | `(player_id, season)` | если у пары есть `Tm = "TOT"` — берётся только TOT; иначе сумма строк команд | TOT уже является суммой команд, сложение = двойной учёт | 2 989 командных строк отброшено anti-join по TOT-ключам; 16 606 → 13 617 |
+| D-2 | stats | `(player_id, season)` | если у пары есть `Tm = "TOT"` — берётся только TOT; иначе сумма строк команд | TOT уже является суммой команд, сложение = двойной учёт | 2 989 командных строк не попадают в сумму; 16 606 → 13 617 |
 | D-3 | salaries | `(player_id, season_end)` | `sum(salary)` | трейд разбивает выплату на несколько строк | 13 612 → 13 237; 375 строк свёрнуто |
 | D-4 | после J2 | `(player_id, season)` | assert `count = 1`, иначе сборка падает | join не должен размножать строки; `distinct` после join запрещён | 12 124 пары, дублей 0 |
 | D-5 | после J2 | `production > 0` | отсечение строк | защита от деления на ноль | −21 строка |
@@ -416,23 +416,24 @@ Dataset<Row> nameMap = registry.filter(col("id_count").equalTo(1))
    Строки без совпадения и с неоднозначным именем отсекаются здесь.
 5. Меры приводятся к `long` (nullable): `G`/`PTS` не фильтруются до свёртки — правило
    «удалить строки без `G`/`PTS`» применяется после неё, как в §4.2.4.
-6. Свёртка до `(player_id, season)`:
+6. Свёртка до `(player_id, season)` условной агрегацией по `Tm`:
 
 ```java
-// Java API принимает список колонок как scala Seq — конверсия инкапсулирована в хелпере
-static Dataset<Row> joinUsing(Dataset<Row> l, Dataset<Row> r, String how, String... using) {
-    return l.join(r, JavaConverters.asScalaBuffer(Arrays.asList(using)).toSeq(), how);
-}
-
-Dataset<Row> tot    = named.filter(col("Tm").equalTo("TOT"));
-Dataset<Row> totKey = tot.select("player_id", "season").distinct();      // ключи, не данные
-Dataset<Row> team   = joinUsing(named.filter(not(col("Tm").equalTo("TOT"))),
-                                broadcast(totKey), "left_anti", "player_id", "season");
-Dataset<Row> collapsed = tot.unionByName(team)
+Column isTot = col("tm").equalTo("TOT");
+Dataset<Row> aggregated = named
     .groupBy("player_id", "season")
-    .agg(first("player_name").as("player_name"),
-         sum("G").as("games"), sum("PTS").as("pts"),
-         sum("TRB").as("trb"), sum("AST").as("ast"));
+    .agg(
+        first("player_name").as("player_name"),
+        max(when(isTot, lit(1)).otherwise(lit(0))).as("has_tot"),
+        sum(when(isTot, col("g"))).as("tot_g"),
+        sum(when(isTot, lit(null).cast("long")).otherwise(col("g"))).as("team_g"),
+        // аналогично для pts, trb, ast
+        ...);
+
+Dataset<Row> collapsed = aggregated
+    .withColumn("games", when(col("has_tot").equalTo(1), col("tot_g")).otherwise(col("team_g")))
+    // аналогично для pts, trb, ast
+    .select("player_id", "season", "player_name", "games", "pts", "trb", "ast");
 
 // строки без G/PTS удаляются; null TRB/AST не заполняются
 Dataset<Row> stats = collapsed
@@ -443,9 +444,10 @@ Dataset<Row> stats = collapsed
    равны `null`, `production` тоже `null`, и строка отсекается фильтром `production > 0`
    на этапе метрики.
 
-`distinct()` здесь — только построение множества TOT-ключей до свёртки; данные не
-дедуплицируются повторно. Anti-join гарантирует, что TOT-строка и строки команд не
-складываются. `player_name` — каноническое имя из `name_map`, константа на `player_id`;
+Условная агрегация обходится без `union` и отдельных TOT-ключей: `has_tot` фиксирует наличие `TOT` у пары,
+`tot_*` суммирует только TOT-строки, `team_*` — только строки команд. Если `TOT` есть,
+выбирается `tot_*` (даже если мера `null`); иначе `team_*`. TOT и командные строки никогда
+не складываются. `player_name` — каноническое имя из `name_map`, константа на `player_id`;
 оно нужно выходной схеме, поэтому переносится через свёртку (исходный `Player` при этом
 отбрасывается, как требует §4.2.4). После свёртки остаются ключи, имя и меры.
 
