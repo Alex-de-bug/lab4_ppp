@@ -1,7 +1,7 @@
 # Дизайн: витрина эффективности игроков NBA (Java 17 + Spark 3.5)
 
 Источник требований — `tz.md`, профили данных — `passports/*.md`.
-Реализация — **Java**, один Maven-проект, два CLI-сценария (сборка и запрос), Spark в локальном режиме.
+Реализация — **Java**, один Maven-проект, один сценарий `Main` (сборка + два явных запроса), Spark в локальном режиме.
 Документ фиксирует архитектуру (C4), потоки данных (DFD), контракты схем и места, где
 обеспечиваются дедупликация, уникальность ключей и partition pruning. Цифры объёмов
 посчитаны по текущим исходным файлам.
@@ -9,8 +9,8 @@
 ## 1. Границы и инварианты
 
 В объёме: очистка трёх CSV, реестр имён с blacklist, два соединения, метрика, запись
-Parquet с партиционированием по сезону, CLI запросов top/undervalued с проверкой каталога
-сезонов и pruning. Вне объёма — инфляционная корректировка, ручное разрешение однофамильцев,
+Parquet с партиционированием по сезону, явные запросы top/undervalued из `Main` с проверкой
+каталога сезонов и pruning. Вне объёма — инфляционная корректировка, ручное разрешение однофамильцев,
 инкрементальные обновления, Hive/метастор, UI (см. `tz.md` §11).
 
 Инварианты, которые проверяются в коде, а не предполагаются:
@@ -22,7 +22,7 @@ Parquet с партиционированием по сезону, CLI запр�
 | I3 | `(player_id, season)` уникален в результате | assert в P6 до записи |
 | I4 | В выходе ровно 9 колонок §6.1, без временных полей | финальный `select` + assert схемы |
 | I5 | `efficiency` хранится как `double` без округления | P6, округление только в выводе запроса |
-| I6 | Чтение — только с корня, `season` из каталогов | DatasetView |
+| I6 | Чтение — только с корня, `season` из каталогов | `Main`: `spark.read().parquet(root)` |
 | I7 | Каталог сезонов строится по ФС, не по диапазону 1985–2017 | SeasonCatalog |
 | I8 | Перезапись корня полная и идемпотентная | PartitionWriter (static overwrite) |
 
@@ -33,11 +33,11 @@ Parquet с партиционированием по сезону, CLI запр�
 | A1 | Связь stats → players только через `name_norm`; имена с `count(distinct _id) > 1` целиком в blacklist | в stats нет ID; угадывать игрока запрещено ТЗ | 43 имени / 89 `_id` исключены; 326 строк stats в периоде потеряны и залогированы |
 | A2 | Агрегация каждой стороны **до** J2; после J2 — только метрика, фильтр и контрольный assert | иначе TOT/командные строки и трейды размножат join | 16 606 → 13 617 и 13 612 → 13 237 до join |
 | A3 | Оба соединения — broadcast малой стороны | стороны 4.6k / 13k строк; shuffle не нужен | `BroadcastHashJoin`, без sort-merge |
-| A4 | `repartition(col("season"))` → `sortWithinPartitions` → `partitionBy("season")` | хеш-партиционирование не разрывает один сезон между задачами | ровно один файл на сезон, файл отсортирован |
+| A4 | `repartition(col("season"))` → `sortWithinPartitions(season ASC, efficiency DESC, player_id ASC)` → `partitionBy("season")` | хеш-партиционирование не разрывает сезон между задачами; Spark при `partitionBy` требует порядок по partition-колонке и иначе добавляет свой `Sort`, теряя порядок файла | ровно один файл на сезон, внутри файла `efficiency DESC, player_id ASC` |
 | A5 | Полная статическая перезапись корня (`mode=overwrite`) | удаляет устаревшие партиции, повторный запуск идемпотентен | каталог сезонов всегда соответствует последней сборке |
 | A6 | Каталог сезонов — обход ФС; запрос читает корень и фильтрует литералом сезона | pruning без хардкода диапазона и без полного сканирования | читается один файл партиции |
 | A7 | Один shaded jar (Spark-зависимости включены), запуск через `run.sh` | `spark-submit` в окружении не установлен; запуск самодостаточен | jar ~300 МБ; `run.sh` добавляет Java 17 `--add-opens`; для `spark-submit` — Maven-профиль `spark-provided` |
-| A8 | Разбор аргументов вручную, без внешней библиотеки | несколько флагов, стандартных средств достаточно | меньше зависимостей; строгая валидация и коды выхода |
+| A8 | `Main` без CLI: сезон, лимиты и `min_games` заданы константами | по требованию нужны явные запросы, а не парсинг аргументов | `./run.sh` без аргументов; смена параметров — правка констант `Main` |
 | A9 | CSV читается с `header=true` без `inferSchema`; нужные колонки — `select` по имени + `cast` | Spark CSV с навязанной `StructType` маппит поля по позиции, а не по имени: частичная схема прочитала бы первые N колонок файла | все поля приходят строками; типы задаются явными cast, лишние колонки не участвуют |
 
 ## 3. C4
@@ -47,11 +47,11 @@ Parquet с партиционированием по сезону, CLI запр�
 ```mermaid
 C4Context
     title C4 L1 - контекст системы
-    Person(analyst, "Аналитик / проверяющий", "Запускает сборку и top-N запросы из CLI")
-    System(mart, "NBA efficiency mart", "Собирает player x season витрину и отвечает на запросы по сезону")
+    Person(analyst, "Аналитик / проверяющий", "Запускает единый сценарий и читает stdout")
+    System(mart, "NBA efficiency mart", "Собирает player x season витрину и отвечает на два запроса")
     System_Ext(src, "Три исходных CSV", "Статистика, игроки, зарплаты; read-only")
     System_Ext(fs, "Файловая система", "Parquet-витрина data/player_season_efficiency")
-    Rel(analyst, mart, "Запускает CLI", "java -jar")
+    Rel(analyst, mart, "Запускает ./run.sh", "java -jar")
     Rel(mart, src, "Читает при сборке", "CSV")
     Rel(mart, fs, "Пишет и читает витрину", "Parquet")
 ```
@@ -61,18 +61,18 @@ C4Context
 ```mermaid
 C4Container
     title C4 L2 - контейнеры
-    Person(analyst, "Аналитик", "CLI")
+    Person(analyst, "Аналитик", "Запускает сценарий")
     System_Ext(src, "Исходные CSV", "read-only")
     Container_Boundary(sys, "NBA efficiency mart") {
+        Container(main, "Main", "Java 17 + Spark 3.5", "Сборка, проверка каталога, два SQL-запроса, вывод")
         Container(build, "BuildJob", "Java 17 + Spark 3.5", "Очистка, дедуп, J1/J2, метрика, запись Parquet")
-        Container(query, "QueryJob", "Java 17 + Spark 3.5", "Каталог сезонов, проверка, SQL top-N")
         ContainerDb(ds, "Parquet-витрина", "local FS", "season=YYYY/part-*.parquet")
     }
-    Rel(analyst, build, "build", "CLI args")
-    Rel(analyst, query, "query --season", "CLI args")
+    Rel(analyst, main, "Запускает ./run.sh", "java -jar")
+    Rel(main, build, "build(...)", "Java")
     Rel(build, src, "Читает", "CSV")
     Rel(build, ds, "Перезаписывает корень", "Parquet")
-    Rel(query, ds, "Читает корень + pruning", "Parquet")
+    Rel(main, ds, "Читает корень + pruning", "Parquet")
 ```
 
 ### 3.3. Уровень 3 — компоненты
@@ -80,27 +80,35 @@ C4Container
 ```mermaid
 C4Component
     title C4 L3 - компоненты
-    Container_Boundary(build, "BuildJob") {
-        Component(argsB, "BuildArgs", "Java", "Флаги, дефолты, валидация")
-        Component(readers, "Readers", "Spark CSV", "select нужных колонок")
-        Component(registry, "NameRegistry", "Spark SQL", "normalize_name, mapping и blacklist")
-        Component(stats, "StatsCollapse", "Spark SQL", "J1 по name_norm, TOT или sum(team)")
-        Component(sal, "SalaryCollapse", "Spark SQL", "Фильтр, sum(salary)")
-        Component(join, "JoinAndMetric", "Spark SQL", "J2, assert, efficiency, production")
-        Component(writer, "PartitionWriter", "Spark", "repartition, sort, overwrite")
-        Component(report, "BuildReport", "slf4j", "Счётчики раздела 9 ТЗ")
-    }
-    Container_Boundary(query, "QueryJob") {
-        Component(argsQ, "QueryArgs", "Java", "Разбор, коды выхода")
-        Component(catalog, "SeasonCatalog", "Hadoop FS", "season=YYYY + parquet")
-        Component(view, "DatasetView", "Spark", "read root, temp view")
-        Component(sql, "TopNQuery", "Spark SQL", "row_number, ORDER BY, LIMIT")
-        Component(format, "OutputFormatter", "Java", "stdout/stderr")
-    }
+    Component(main, "Main", "Java", "build + top-5 + undervalued-10")
+    Component(build, "BuildJob", "Spark", "P1-P7")
+    Component(catalog, "SeasonCatalog", "java.nio", "season=YYYY + parquet")
+    Component(view, "DatasetView", "Spark", "read root, temp view")
+    Component(top, "TopNQuery", "Spark SQL", "efficiency DESC, LIMIT 5")
+    Component(under, "UndervaluedQuery", "Spark SQL", "efficiency ASC, LIMIT 10")
+    Component(format, "OutputFormatter", "Java", "stdout/stderr")
+    Component(readers, "Readers", "Spark CSV", "select нужных колонок")
+    Component(registry, "NameRegistry", "Spark SQL", "normalize_name, mapping и blacklist")
+    Component(stats, "StatsCollapse", "Spark SQL", "J1 по name_norm, TOT или sum(team)")
+    Component(sal, "SalaryCollapse", "Spark SQL", "Фильтр, sum(salary)")
+    Component(join, "JoinAndMetric", "Spark SQL", "J2, assert, efficiency, production")
+    Component(writer, "PartitionWriter", "Spark", "repartition, sort, overwrite")
+    Component(report, "BuildReport", "slf4j", "Счётчики раздела 9 ТЗ")
     ContainerDb_Ext(src, "Исходные CSV", "FS", "read-only")
     ContainerDb_Ext(ds, "Parquet-витрина", "local FS", "data/player_season_efficiency")
 
-    Rel(argsB, readers, "пути и дефолты")
+    Rel(main, build, "сборка")
+    Rel(main, catalog, "проверка сезона 1991")
+    Rel(main, view, "read root")
+    Rel(main, top, "top-5")
+    Rel(main, under, "undervalued-10")
+    Rel(main, ds, "partition discovery", "Parquet")
+    Rel(catalog, view, "сезон валиден")
+    Rel(view, top, "temp view")
+    Rel(view, under, "temp view")
+    Rel(top, format, "rank + строки")
+    Rel(under, format, "rank + строки")
+    Rel(build, readers, "читает три CSV")
     Rel(readers, src, "читает", "CSV")
     Rel(readers, registry, "players")
     Rel(readers, stats, "stats")
@@ -113,26 +121,65 @@ C4Component
     Rel(registry, report, "счётчики")
     Rel(stats, report, "счётчики")
     Rel(join, report, "счётчики")
-    Rel(argsQ, catalog, "путь и сезон")
-    Rel(catalog, view, "сезон валиден")
-    Rel(view, ds, "root + discovery", "Parquet")
-    Rel(view, sql, "temp view")
-    Rel(sql, format, "top-N")
-    Rel(argsQ, format, "ошибки и предупреждения")
+    Rel(report, format, "stdout")
 ```
 
-Контракт компонентов: `Readers` отдаёт три `Dataset<Row>` с уже спроецированными колонками;
-`NameRegistry` — два малых датасета (`name_map`, `blacklist`); `StatsCollapse` и
-`SalaryCollapse` — по одной строке на ключ; `JoinAndMetric` — финальные 9 колонок;
-`PartitionWriter` не знает ничего о происхождении данных. `BuildReport` — единственный
-потребитель счётчиков, собирает их до записи (датасеты кэшируются, чтобы не пересчитывать план).
+Контракт компонентов: `Main` — единственный сценарий: `BuildJob.build(...)`, проверка
+каталога через `SeasonCatalog`, чтение корня и два явных SQL. `Readers` отдаёт три
+`Dataset<Row>` с уже спроецированными колонками; `NameRegistry` — два малых датасета
+(`name_map`, `blacklist`); `StatsCollapse` и `SalaryCollapse` — по одной строке на ключ;
+`JoinAndMetric` — финальные 9 колонок; `PartitionWriter` не знает ничего о происхождении
+данных. `BuildReport` — единственный потребитель счётчиков, собирает их до записи
+(датасеты кэшируются, чтобы не пересчитывать план).
 
 ## 4. DFD
 
-### 4.1. Уровень 1 — потоки данных, оба join и потери строк
+### 4.1. Элементы DFD
+
+**Внешние сущности**
+
+| ID | Элемент | Роль |
+|---|---|---|
+| E1 | Аналитик | запускает `./run.sh`, читает stdout |
+| F1 | `Seasons_Stats.xls` | read-only источник сезонной статистики |
+| F2 | `players.csv` | read-only справочник игроков |
+| F3 | `salaries_1985to2018.csv` | read-only источник зарплат |
+
+**Процессы**
+
+| ID | Процесс | Вход → выход |
+|---|---|---|
+| M0 | Main scenario | E1 → `BuildJob` → P8–P10 → stdout |
+| P1 | players registry | `players.csv` → `D1`, `D2` |
+| P2 | stats clean | `Seasons_Stats.xls` → очищенные строки периода 1985–2017 |
+| J1 | name lookup | stats + `D1` → stats с `player_id` |
+| P3 | stats collapse | J1 → `D3` (TOT или сумма команд) |
+| P4 | salaries clean | `salaries.csv` → строки периода, `salary > 0` |
+| P5 | salary sum | P4 → `D4` (сумма по трейдам) |
+| J2 | salary join | `D3` + `D4` → строки `(player_id, season)` |
+| P6 | metric | J2 → `production`, `efficiency`, assert уникальности |
+| P7 | partition write | P6 → `D5` |
+| P8 | season catalog | `D5` → проверенный сезон 1991 |
+| P9 | top-5 query | `D5` → stdout, `efficiency DESC` |
+| P10 | undervalued-10 query | `D5` → stdout, `efficiency ASC` |
+
+**Хранилища данных**
+
+| ID | Хранилище | Содержимое |
+|---|---|---|
+| D1 | `name_map` | `name_norm → player_id, player_name` без однофамильцев |
+| D2 | `blacklist` | `name_norm → [player_id]` для отчёта |
+| D3 | `stats` | одна строка на `(player_id, season)` |
+| D4 | `salaries` | одна строка на `(player_id, season_end)` |
+| D5 | Parquet-витрина | `season=YYYY/part-*.parquet`, 1 файл на сезон |
+
+### 4.2. Уровень 1 — потоки данных, оба join и потери строк
 
 ```mermaid
 flowchart TB
+    E1["E1 Аналитик"]
+    M0["M0 - Main<br/>build + top-5 + undervalued-10"]
+
     subgraph SRC["Источники (read-only)"]
         direction LR
         F1["Seasons_Stats.xls<br/>CSV: статистика"]
@@ -154,18 +201,23 @@ flowchart TB
         D4[("D4 salaries<br/>1 строка на (player_id, season_end)")]
         J2["J2 - inner join<br/>player_id = player_id<br/>AND season = season_end<br/>broadcast(D4)"]
         P6["P6 - efficiency = salary / (pts + trb + ast)<br/>production больше нуля<br/>assert unique(player_id, season)"]
-        P7["P7 - repartition(season)<br/>sortWithinPartitions(efficiency DESC, player_id ASC)<br/>write partitionBy(season), overwrite"]
+        P7["P7 - repartition(season)<br/>sortWithinPartitions(season, efficiency DESC, player_id ASC)<br/>write partitionBy(season), overwrite"]
         D5[("D5 витрина Parquet<br/>каталоги season=YYYY, 1 файл на сезон")]
         R1["R1 build report<br/>счётчики раздела 9 ТЗ"]
     end
 
-    subgraph QRY["Запрос - QueryJob"]
+    subgraph QRY["Запросы - Main (без CLI)"]
         direction TB
-        P8["P8 - каталог: season=YYYY и минимум 1 parquet<br/>проверка --season"]
-        P9["P9 - read root (partition discovery)<br/>WHERE season = YYYY AND games >= M<br/>row_number + ORDER BY + LIMIT"]
-        OUT["stdout: rank, player_id, player_name,<br/>season, games, salary, pts, trb, ast, efficiency"]
+        P8["P8 - каталог: season=YYYY и минимум 1 parquet<br/>проверка сезона 1991"]
+        P9["P9 - top-5<br/>read root (partition discovery)<br/>WHERE season = 1991 AND games >= 20<br/>ORDER BY efficiency DESC, player_id ASC<br/>LIMIT 5"]
+        P10["P10 - undervalued-10<br/>WHERE season = 1991 AND games >= 20<br/>ORDER BY efficiency ASC, player_id ASC<br/>LIMIT 10"]
+        OUT["stdout: заголовки и строки<br/>rank, player_id, player_name,<br/>season, games, salary, pts, trb, ast, efficiency"]
     end
 
+    E1 -->|"запуск ./run.sh"| M0
+    M0 -->|"build()"| P1
+    M0 -->|"запросы"| P8
+    OUT -->|"stdout: две таблицы"| E1
     F2 --> P1
     P1 --> D1
     P1 -.-> D2
@@ -183,20 +235,24 @@ flowchart TB
     P6 -->|production больше нуля| P7
     P7 --> D5
     D5 --> P8
-    P8 --> P9
+    P8 -->|сезон есть в каталоге| P9
+    P8 -->|сезон есть в каталоге| P10
     P9 --> OUT
+    P10 --> OUT
     D2 -.-> R1
     P3 -.-> R1
     J2 -.-> R1
     P6 -.-> R1
 ```
 
-Сплошные стрелки — основные данные; пунктир — счётчики в отчёт. На рёбрах показаны только
-правила отсечения, без фактических объёмов (они — в таблице 4.3). Порядок строго по ТЗ §4:
-сначала независимая очистка и агрегация каждой стороны, затем J2; J1 — это не join из §4.4,
-а lookup внутри подготовки stats (по §4.2).
+Сплошные стрелки — основные данные; пунктир — счётчики в отчёт. E1 запускает M0; M0
+вызывает `BuildJob` (P1–P7), затем P8–P10 и получает stdout. Значения `1991`, `20`, `5`
+и `10` — константы `Main`. На рёбрах показаны только правила отсечения, без фактических
+объёмов (они — в таблице 4.4). Порядок строго по ТЗ §4: сначала независимая очистка и
+агрегация каждой стороны, затем J2; J1 — это не join из §4.4, а lookup внутри подготовки
+stats (по §4.2).
 
-### 4.2. Где именно учтён дедуп
+### 4.3. Где именно учтён дедуп
 
 | # | Датасет | Ключ | Правило | Почему так | Эффект на текущих данных |
 |---|---|---|---|---|---|
@@ -210,7 +266,7 @@ flowchart TB
 считает именно `DISTINCT _id`. Blacklist применяется ко всем сезонам игрока, даже если
 статистика есть только за часть сезонов.
 
-### 4.3. Объёмы по этапам (текущие файлы)
+### 4.4. Объёмы по этапам (текущие файлы)
 
 | Этап | players | stats | salaries |
 |---|---:|---:|---:|
@@ -480,7 +536,10 @@ Dataset<Row> result = joined
 
 ```java
 result.repartition(col("season"))
-      .sortWithinPartitions(col("efficiency").desc(), col("player_id").asc())
+      .sortWithinPartitions(
+              col("season").asc(),
+              col("efficiency").desc(),
+              col("player_id").asc())
       .write().mode(SaveMode.Overwrite).partitionBy("season")
       .parquet(output);
 ```
@@ -488,12 +547,14 @@ result.repartition(col("season"))
 - `repartition(col("season"))` — хеш по сезону: строки одного сезона не разрываются между
   задачами. Каждый сезон пишется из одной задачи, поэтому в `season=YYYY/` появляется ровно
   один Parquet-файл (служебные `_SUCCESS`, `_committed_*`, `_started_*` — не данные).
-- `sortWithinPartitions` сортирует строки задачи целиком; сортировка одного сезона
-  гарантирована, так как все его строки в одной задаче.
+- `season` идёт первым в `sortWithinPartitions`: Spark при `partitionBy` сам требует порядок
+  по partition-колонке и иначе добавляет свой `Sort`, который теряет порядок
+  `efficiency DESC, player_id ASC`. Внутри файла сезон константен, поэтому остаётся
+  требуемый порядок.
 - `mode(overwrite)` в статическом режиме (по умолчанию `partitionOverwriteMode=static`)
   удаляет содержимое корня до записи: устаревшие партиции не остаются, повторная сборка
-  идемпотентна. Каталог `--output` считается принадлежащим джобе; посторонние файлы в нём
-  будут удалены.
+  идемпотентна. Корень `data/player_season_efficiency` считается принадлежащим джобе;
+  посторонние файлы в нём будут удалены.
 - AQE может укрупнить партиции, но не разрывает одинаковые ключи между задачами; на
   «один файл на сезон» это не влияет.
 
@@ -519,48 +580,42 @@ result.repartition(col("season"))
 `_id` и числом исключённых строк); исключено из-за отсутствия зарплаты; пары зарплат без
 статистики; TRB/AST null → 0; `production <= 0`; строки и сезоны результата.
 
-## 7. Запрос
+## 7. Запросы в Main
 
-### 7.1. CLI и коды выхода
+### 7.1. Сценарий и фиксированные параметры
 
-| Сценарий | Аргументы | Дефолты |
-|---|---|---|
-| build | `--stats`, `--players`, `--salaries`, `--output` | файлы и `data/player_season_efficiency` от cwd (как в §8.1 ТЗ) |
-| query | `--season` (обязателен), `--type top\|undervalued`, `--limit`, `--min-games`, `--data`, `--explain` | тип `top`; limit 5 для top и 10 для undervalued; `min-games` 20; data от корня проекта |
+CLI отсутствует: `Main` вызывает сборку и затем оба запроса с константами.
 
-Разбор аргументов — вручную; `--season` парсится `Integer.parseInt` (пустое/нецелое —
-ошибка), `--limit > 0`, `--min-games >= 0`, `--type` из двух значений. Относительные
-явные пути разрешаются от cwd; дефолты build — от cwd, дефолты query — от корня проекта
-(§7.1.5). Корень проекта определяется по расположению jar/classes (снимаются хвостовые
-компоненты `target` и `classes`); если в нём нет `players.csv` — fallback на cwd.
-Поэтому дефолтный `--data` не зависит от cwd.
+| Параметр | Значение | Где задан |
+|---|---:|---|
+| `season` | 1991 | `Main.SEASON` |
+| `min_games` | 20 | `Main.MIN_GAMES` |
+| top limit | 5 | `Main.TOP_LIMIT` |
+| undervalued limit | 10 | `Main.UNDERVALUED_LIMIT` |
+| корень витрины | `<project>/data/player_season_efficiency` | `ProjectPaths.projectRoot()` |
 
-| Код | Когда |
-|---:|---|
-| 0 | успех, включая «нет кандидатов после min_games» |
-| 2 | ошибка аргументов (сезон/limit/min-games/type) |
-| 3 | корень отсутствует или каталог сезонов пуст |
-| 4 | сезона нет в каталоге |
-| 5 | ошибка Spark/ФС при чтении или запросе |
+`run.sh` запускает jar без аргументов. `Main` всегда пересобирает витрину, проверяет каталог
+сезонов, читает корень и печатает два результата. Ошибка (датасет не найден/пуст, сезон
+отсутствует, сбой Spark) — исключение: `Main` печатает сообщение и завершает процесс с кодом 1.
 
 ### 7.2. Каталог сезонов
 
-`SeasonCatalog.scan(root)` через Hadoop `FileSystem`:
+`SeasonCatalog.scan(root)` через `java.nio.file`:
 
-1. Корень не существует → код 3, `датасет не найден: <path>`.
+1. Корень не существует → `датасет не найден: <path>`.
 2. Для каждого элемента корня: каталог, имя строго `season=(\d{4})` (ровно 4 цифры),
    внутри есть хотя бы один файл `*.parquet` (без учёта `_SUCCESS`/`_committed_*`).
    Прочие каталоги и файлы игнорируются. Это и есть «каталог сезонов»; диапазон
    1985–2017 не участвует.
-3. Список пуст → код 3, `датасет пуст: <path>`.
-4. `--season` не найден → код 4 и точное сообщение:
-   `сезон YYYY отсутствует в каталоге; доступные сезоны: 1985, 1986, ...` (по возрастанию).
-5. Найден → читаем корень; фильтр `games >= min_games` может дать 0 строк — это успех (0),
+3. Список пуст → `датасет пуст: <path>`.
+4. Сезона 1991 нет → `сезон 1991 отсутствует в каталоге; доступные сезоны: ...`
+   (по возрастанию).
+5. Найден → читаем корень; фильтр `games >= min_games` может дать 0 строк — это успех,
    заголовок + предупреждение в stderr.
 
-Проверка каталога не запускает Spark-job: это ~33 операции `listStatus`, что дешевле
+Проверка каталога не запускает Spark-job: это ~33 операции обхода ФС, что дешевле
 валидации через чтение датасета. Гонка «каталог удалён между проверкой и чтением» —
-ошибка Spark, код 5.
+ошибка Spark, обрабатывается общим исключением `Main`.
 
 ### 7.3. Чтение и pruning
 
@@ -571,10 +626,10 @@ ds.createOrReplaceTempView("player_season_efficiency");
 
 `season` восстанавливается из имён каталогов (тип int). Ручное перечисление сезонов,
 чтение `season=YYYY` напрямую и схема с объявленным `season` запрещены. Фильтр сезона —
-целочисленный литерал в SQL (значение уже провалидировано), поэтому Catalyst формирует
-`PartitionFilters: ... (season = YYYY)`. `--explain` печатает план в stderr (stdout остаётся
-данными); без флага план доступен в DEBUG-логе. Проверка: в плане `FileScan parquet` один
-файл партиции.
+целочисленный литерал `1991` в SQL, поэтому Catalyst формирует
+`PartitionFilters: ... (season = 1991)`. План можно вывести через
+`queryExecution().executedPlan()` при проверке; в обычном выводе он не печатается, stdout
+остаётся данными. Проверка: в плане `FileScan parquet` один файл партиции.
 
 ### 7.4. SQL top-N
 
@@ -587,22 +642,24 @@ ORDER BY efficiency {DESC|ASC}, player_id ASC
 LIMIT {limit}
 ```
 
-`DESC` для `--type top`, `ASC` для `undervalued`. Тай-брейк `player_id ASC` делает порядок
-детерминированным. Окно считается по уже отфильтрованному набору (≤ одной партиции),
-`LIMIT` ограничивает вывод. В SQL подставляются только провалидированные `int`-литералы и
-значение enum, поэтому интерполяция безопасна и не мешает pruning. Никакой запрос не
-полагается на физический порядок файла.
+`DESC` для top-5, `ASC` для undervalued-10; это две явные SQL-строки в `Main`. Тай-брейк
+`player_id ASC` делает порядок детерминированным. Окно считается по уже отфильтрованному
+набору (≤ одной партиции), `LIMIT` ограничивает вывод. В SQL подставляются только
+`int`-константы `Main`, поэтому интерполяция безопасна и не мешает pruning. Никакой запрос
+не полагается на физический порядок файла.
 
 ### 7.5. Вывод
 
-- stdout: строка заголовка и строки результата, колонки через табуляцию:
+- stdout: заголовок запроса, строка колонок и строки результата; для top-5 и
+  undervalued-10 — отдельные блоки. Колонки через табуляцию:
   `rank	player_id	player_name	season	games	salary	pts	trb	ast	efficiency`.
 - `salary` — целое, `efficiency` — `%.6f` (округление только на выводе; в Parquet значение
   не округляется). Форматирование — через `Locale.ROOT`, чтобы в русской локали не
   появилась десятичная запятая.
 - stderr: предупреждения `найдено M < N кандидатов` или `нет кандидатов` (при 0 строк
-  после `min_games` заголовок всё равно печатается), ошибки с кодами.
-- Spark-логи приглушаются до WARN, чтобы stdout оставался машиночитаемым.
+  после `min_games` заголовок всё равно печатается). Ошибки сборки/запроса `Main` печатает
+  в stderr и завершает процесс с кодом 1.
+- Spark-логи приглушаются до WARN, чтобы stdout оставался читаемым.
 
 ## 8. Почему путь данных оптимален
 
@@ -622,8 +679,10 @@ LIMIT {limit}
    заведомо малы; hint `broadcast()` фиксирует выбор независимо от порога.
 5. **Один узкий этап после J2.** Метрика и фильтр — map-операции без обмена; единственный
    shuffle сборки — `repartition(season)` перед записью.
-6. **Сортировка только внутри партиции.** `sortWithinPartitions` не требует глобального
-   sort-shuffle; при этом каждый файл отсортирован по `efficiency DESC, player_id ASC`.
+6. **Сортировка только внутри партиции.** `sortWithinPartitions(season, efficiency DESC,
+   player_id ASC)` не требует глобального sort-shuffle; `season` идёт первым, потому что
+   Spark при `partitionBy` иначе добавляет собственный `Sort` по partition-колонке и
+   теряет порядок файла. Внутри файла остаётся `efficiency DESC, player_id ASC`.
 7. **Запись без лишних файлов.** Хеш-партиционирование по сезону + `partitionBy` даёт ровно
    33 файла (по одному на сезон) и полную перезапись корня.
 8. **Запрос без полного сканирования.** Каталог — обход ФС, затем pruning по `season`:
@@ -641,7 +700,7 @@ LIMIT {limit}
 | Р-3 | Зарплаты не приведены к инфляции | метрика сравнивается только внутри сезона; межсезонные сравнения запрещены |
 | Р-4 | `TRB`/`AST` null трактуются как 0 | число замен в отчёте; на текущих данных 0 |
 | Р-5 | Физическая сортировка файла не является контрактом запроса | каждый запрос содержит `ORDER BY`; top-5 может использовать early-stop, но не обязан |
-| Р-6 | Полная перезапись корня удаляет всё в `--output` | путь считается принадлежащим сборке; это требование §6.2 |
+| Р-6 | Полная перезапись корня удаляет всё в `data/player_season_efficiency` | путь считается принадлежащим сборке; это требование §6.2 |
 | Р-7 | `season` после чтения оказывается последней колонкой | запросы перечисляют колонки явно; проверяется набор, а не порядок |
 | Р-8 | Добавленный вручную каталог `season=YYYY` меняет каталог сезонов | это требуемое поведение §6.2.5; некорректный шаблон игнорируется |
 | Р-9 | Один сезон может оказаться в задаче вместе с другими | на «1 файл на сезон» не влияет: каждая задача пишет отдельный файл в каталог каждого сезона |
@@ -651,11 +710,13 @@ LIMIT {limit}
 
 ```bash
 mvn -q package
-./run.sh build
-./run.sh query --season 1991 --type top --limit 5 --explain
-./run.sh query --season 1991 --type undervalued --limit 10
+./run.sh
 find data/player_season_efficiency -name '*.parquet' | wc -l   # 33
 ```
+
+`./run.sh` выполняет весь сценарий: сборку, top-5 и undervalued-10 для сезона 1991.
+Пункты ТЗ, завязанные на CLI (`--season`, `--data`, коды выхода), заменены явным сценарием
+`Main`; семантика проверки сезона, пустого результата и ошибок сохранена.
 
 Соответствие критериям §10 ТЗ:
 
@@ -668,9 +729,9 @@ find data/player_season_efficiency -name '*.parquet' | wc -l   # 33
 | 5 | дедуп до join, нет пост-join преобразований | D-2/D-3; после J2 только метрика/фильтр, плюс контрольный assert D-4 (не меняет данные) |
 | 6 | `efficiency = salary / production` (±1e-9) | P6; сверка SQL-выражением |
 | 7 | N строк, порядок, сезон, тай-брейк | SQL `ORDER BY … , player_id`, `LIMIT` |
-| 8 | `PartitionFilters` и один файл | литерал сезона, `--explain`, физический план |
-| 9 | нет сезона ≠ нет кандидатов | каталог + коды 4/0 и разные сообщения |
-| 10 | абсолютный `--data`, независимость от cwd | resolved path + чтение по абсолютному пути |
+| 8 | `PartitionFilters` и один файл | фиксированный литерал `1991`; `executedPlan()` при проверке |
+| 9 | нет сезона ≠ нет кандидатов | `validateSeason` + разные сообщения; пустой результат после `min_games` — предупреждение |
+| 10 | запуск не зависит от cwd | `ProjectPaths.projectRoot()` для исходников и витрины |
 | 11 | физический порядок в файле | `sortWithinPartitions`; последовательное чтение одной партиции |
 | 12 | отчёт §9 | BuildReport, поля перечислены в 6.8 |
 
@@ -678,13 +739,12 @@ find data/player_season_efficiency -name '*.parquet' | wc -l   # 33
 
 ```text
 pom.xml                                  # Java 17, Spark 3.5.x, maven-shade, профиль spark-provided
-run.sh                                   # java --add-opens ... -jar target/nba-efficiency.jar "$@"
+run.sh                                   # java --add-opens ... -jar target/nba-efficiency.jar (без аргументов)
 src/main/java/ru/ppp/lab4/
-  Main.java                              # build|query, коды выхода
-  common/Args.java                       # ручной разбор, валидация
+  Main.java                              # сценарий: build + top-5 + undervalued-10
   common/Names.java                      # normalizeName(Column)
   common/SeasonCatalog.java              # обход ФС, season=YYYY
-  common/ProjectPaths.java               # корень проекта, дефолты
+  common/ProjectPaths.java               # корень проекта, пути исходников и витрины
   common/Spark.java                      # SparkSession (local[*])
   build/BuildJob.java                    # оркестрация P1-P7
   build/Readers.java                     # 3 CSV: header=true, select по имени, cast
@@ -694,7 +754,6 @@ src/main/java/ru/ppp/lab4/
   build/JoinAndMetric.java               # J2, assert, efficiency
   build/PartitionWriter.java             # repartition/sort/overwrite
   build/BuildReport.java                 # счётчики §9
-  query/QueryJob.java                    # каталог, view, SQL, вывод
 ```
 
 Компоненты C4 соответствуют пакетам/классам один-к-одному; мелкие утилиты (`Names`,
