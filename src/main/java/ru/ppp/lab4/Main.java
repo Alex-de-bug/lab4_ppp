@@ -26,8 +26,8 @@ public final class Main {
 
     private static final int SEASON = 1991;
     private static final int MIN_GAMES = 20;
-    private static final int TOP_LIMIT = 5;
-    private static final int UNDERVALUED_LIMIT = 10;
+    private static final int TOP_LIMIT = 10;
+    private static final int UNDERVALUED_LIMIT = 5;
 
     private Main() {
     }
@@ -89,7 +89,7 @@ public final class Main {
         WindowSpec window = Window.partitionBy(col("season"))
                 .orderBy(col("efficiency").desc(), col("player_id").asc());
         Dataset<Row> result = dataset
-                .filter(col("season").equalTo(SEASON).and(col("games").geq(MIN_GAMES)))
+                .filter(col("season").equalTo(SEASON))
                 .withColumn("rank", row_number().over(window))
                 .select(col("rank"), col("player_id"), col("player_name"), col("season"),
                         col("games"), col("salary"), col("pts"), col("trb"), col("ast"),

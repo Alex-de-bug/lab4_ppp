@@ -80,12 +80,12 @@ C4Container
 ```mermaid
 C4Component
     title C4 L3 - компоненты
-    Component(main, "Main", "Java", "build + top-5 + undervalued-10")
+    Component(main, "Main", "Java", "build + top-10 + undervalued-5")
     Component(build, "BuildJob", "Spark", "P1-P7")
     Component(catalog, "SeasonCatalog", "java.nio", "season=YYYY + parquet")
     Component(view, "DatasetView", "Spark", "read root")
-    Component(top, "TopNQuery", "DataFrame API", "efficiency DESC, limit 5")
-    Component(under, "UndervaluedQuery", "DataFrame API", "efficiency ASC, limit 10")
+    Component(top, "TopNQuery", "DataFrame API", "efficiency DESC, limit 10")
+    Component(under, "UndervaluedQuery", "DataFrame API", "efficiency ASC, limit 5")
     Component(format, "OutputFormatter", "Java", "stdout/stderr")
     Component(readers, "Readers", "Spark CSV", "select нужных колонок")
     Component(registry, "NameRegistry", "DataFrame API", "normalize_name, mapping и blacklist")
@@ -100,8 +100,8 @@ C4Component
     Rel(main, build, "сборка")
     Rel(main, catalog, "проверка сезона 1991")
     Rel(main, view, "read root")
-    Rel(main, top, "top-5")
-    Rel(main, under, "undervalued-10")
+    Rel(main, top, "top-10")
+    Rel(main, under, "undervalued-5")
     Rel(main, ds, "partition discovery", "Parquet")
     Rel(catalog, view, "сезон валиден")
     Rel(view, top, "Dataset<Row>")
@@ -160,8 +160,8 @@ C4Component
 | P6 | metric | J2 → `production`, `efficiency`, assert уникальности |
 | P7 | partition write | P6 → `D5` |
 | P8 | season catalog | `D5` → проверенный сезон 1991 |
-| P9 | top-5 query | `D5` → stdout, `efficiency DESC` |
-| P10 | undervalued-10 query | `D5` → stdout, `efficiency ASC` |
+| P9 | top-10 query | `D5` → stdout, `efficiency DESC` |
+| P10 | undervalued-5 query | `D5` → stdout, `efficiency ASC` |
 
 **Хранилища данных**
 
@@ -178,7 +178,7 @@ C4Component
 ```mermaid
 flowchart TB
     E1["E1 Аналитик"]
-    M0["M0 - Main<br/>build + top-5 + undervalued-10"]
+    M0["M0 - Main<br/>build + top-10 + undervalued-5"]
 
     subgraph SRC["Источники (read-only)"]
         direction LR
@@ -209,8 +209,8 @@ flowchart TB
     subgraph QRY["Запросы - Main (без CLI)"]
         direction TB
         P8["P8 - каталог: season=YYYY и минимум 1 parquet<br/>проверка сезона 1991"]
-        P9["P9 - top-5<br/>read root (partition discovery)<br/>filter(season=1991, games>=20)<br/>row_number over(efficiency DESC, player_id ASC)<br/>orderBy + limit(5)"]
-        P10["P10 - undervalued-10<br/>filter(season=1991, games>=20)<br/>row_number over(efficiency ASC, player_id ASC)<br/>orderBy + limit(10)"]
+        P9["P9 - top-10<br/>read root (partition discovery)<br/>filter(season=1991, games>=20)<br/>row_number over(efficiency DESC, player_id ASC)<br/>orderBy + limit(10)"]
+        P10["P10 - undervalued-5<br/>filter(season=1991, games>=20)<br/>row_number over(efficiency ASC, player_id ASC)<br/>orderBy + limit(5)"]
         OUT["stdout: заголовки и строки<br/>rank, player_id, player_name,<br/>season, games, salary, pts, trb, ast, efficiency"]
     end
 
@@ -590,8 +590,8 @@ CLI отсутствует: `Main` вызывает сборку и затем �
 |---|---:|---|
 | `season` | 1991 | `Main.SEASON` |
 | `min_games` | 20 | `Main.MIN_GAMES` |
-| top limit | 5 | `Main.TOP_LIMIT` |
-| undervalued limit | 10 | `Main.UNDERVALUED_LIMIT` |
+| top limit | 10 | `Main.TOP_LIMIT` |
+| undervalued limit | 5 | `Main.UNDERVALUED_LIMIT` |
 | корень витрины | `<project>/data/player_season_efficiency` | `ProjectPaths.projectRoot()` |
 
 `run.sh` запускает jar без аргументов. `Main` всегда пересобирает витрину, проверяет каталог
@@ -654,8 +654,8 @@ Dataset<Row> result = dataset
 
 ### 7.5. Вывод
 
-- stdout: заголовок запроса, строка колонок и строки результата; для top-5 и
-  undervalued-10 — отдельные блоки. Колонки через табуляцию:
+- stdout: заголовок запроса, строка колонок и строки результата; для top-10 и
+  undervalued-5 — отдельные блоки. Колонки через табуляцию:
   `rank	player_id	player_name	season	games	salary	pts	trb	ast	efficiency`.
 - `salary` — целое, `efficiency` — `%.6f` (округление только на выводе; в Parquet значение
   не округляется). Форматирование — через `Locale.ROOT`, чтобы в русской локали не
@@ -703,7 +703,7 @@ Dataset<Row> result = dataset
 | Р-2 | Сезоны 1987 и 1990 неполны в зарплатах | пропуски не заполняются; отсутствие зарплаты ≠ отсутствие контракта |
 | Р-3 | Зарплаты не приведены к инфляции | метрика сравнивается только внутри сезона; межсезонные сравнения запрещены |
 | Р-4 | `TRB`/`AST` null трактуются как 0 | число замен в отчёте; на текущих данных 0 |
-| Р-5 | Физическая сортировка файла не является контрактом запроса | каждый запрос содержит `orderBy`; top-5 может использовать early-stop, но не обязан |
+| Р-5 | Физическая сортировка файла не является контрактом запроса | каждый запрос содержит `orderBy`; top-10 может использовать early-stop, но не обязан |
 | Р-6 | Полная перезапись корня удаляет всё в `data/player_season_efficiency` | путь считается принадлежащим сборке; это требование §6.2 |
 | Р-7 | `season` после чтения оказывается последней колонкой | запросы перечисляют колонки явно; проверяется набор, а не порядок |
 | Р-8 | Добавленный вручную каталог `season=YYYY` меняет каталог сезонов | это требуемое поведение §6.2.5; некорректный шаблон игнорируется |
@@ -718,7 +718,7 @@ mvn -q package
 find data/player_season_efficiency -name '*.parquet' | wc -l   # 33
 ```
 
-`./run.sh` выполняет весь сценарий: сборку, top-5 и undervalued-10 для сезона 1991.
+`./run.sh` выполняет весь сценарий: сборку, top-10 и undervalued-5 для сезона 1991.
 Пункты ТЗ, завязанные на CLI (`--season`, `--data`, коды выхода), заменены явным сценарием
 `Main`; семантика проверки сезона, пустого результата и ошибок сохранена.
 
@@ -745,7 +745,7 @@ find data/player_season_efficiency -name '*.parquet' | wc -l   # 33
 pom.xml                                  # Java 17, Spark 3.5.x, maven-shade, профиль spark-provided
 run.sh                                   # java --add-opens ... -jar target/nba-efficiency.jar (без аргументов)
 src/main/java/ru/ppp/lab4/
-  Main.java                              # сценарий: build + top-5 + undervalued-10
+  Main.java                              # сценарий: build + top-10 + undervalued-5
   common/Names.java                      # normalizeName(Column)
   common/SeasonCatalog.java              # обход ФС, season=YYYY
   common/ProjectPaths.java               # корень проекта, пути исходников и витрины
