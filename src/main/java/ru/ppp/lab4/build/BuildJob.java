@@ -3,15 +3,11 @@ package ru.ppp.lab4.build;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
-import ru.ppp.lab4.common.Args;
 import ru.ppp.lab4.common.Names;
-import ru.ppp.lab4.common.Spark;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.Locale;
-import java.util.Set;
 
 import static org.apache.spark.sql.functions.broadcast;
 import static org.apache.spark.sql.functions.coalesce;
@@ -25,48 +21,13 @@ import static org.apache.spark.sql.functions.trim;
 /** Сборка: очистка каждого источника, J1 по имени, J2 с зарплатами, метрика и Parquet. */
 public final class BuildJob {
 
-    public int run(String[] argv) {
-        Args args;
-        try {
-            args = Args.parse(argv,
-                    Set.of("stats", "players", "salaries", "output"),
-                    Set.of());
-        } catch (Args.ArgException e) {
-            System.err.println(e.getMessage());
-            return 2;
-        }
-
-        Path cwd = Paths.get("").toAbsolutePath().normalize();
-        Path statsPath = resolve(cwd, args.getOr("stats", "Seasons_Stats.xls"));
-        Path playersPath = resolve(cwd, args.getOr("players", "players.csv"));
-        Path salariesPath = resolve(cwd, args.getOr("salaries", "salaries_1985to2018.csv"));
-        Path output = resolve(cwd, args.getOr("output", "data/player_season_efficiency"));
-
+    public static void build(SparkSession spark, Path statsPath, Path playersPath,
+                             Path salariesPath, Path output) {
         for (Path input : new Path[]{statsPath, playersPath, salariesPath}) {
             if (!Files.isRegularFile(input)) {
-                System.err.println("файл не найден: " + input);
-                return 1;
+                throw new IllegalArgumentException("файл не найден: " + input);
             }
         }
-
-        SparkSession spark = null;
-        try {
-            spark = Spark.session("nba-efficiency-build");
-            build(spark, statsPath, playersPath, salariesPath, output);
-            return 0;
-        } catch (Exception e) {
-            System.err.println("сборка не удалась: " + e.getMessage());
-            e.printStackTrace(System.err);
-            return 1;
-        } finally {
-            if (spark != null) {
-                spark.stop();
-            }
-        }
-    }
-
-    private static void build(SparkSession spark, Path statsPath, Path playersPath,
-                              Path salariesPath, Path output) {
         BuildReport report = new BuildReport();
 
         // P1: players -> name_map / blacklist.
@@ -204,10 +165,5 @@ public final class BuildJob {
         // P7: запись.
         PartitionWriter.write(result, output.toString());
         System.out.printf(Locale.ROOT, "[write]     %s%n", output);
-    }
-
-    private static Path resolve(Path cwd, String value) {
-        Path path = Paths.get(value);
-        return (path.isAbsolute() ? path : cwd.resolve(path)).normalize();
     }
 }

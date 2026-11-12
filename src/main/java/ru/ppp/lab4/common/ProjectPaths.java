@@ -5,7 +5,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
-/** Корень проекта, от которого разрешается дефолтный --data (не зависит от cwd). */
+/** Корень проекта, от которого разрешаются исходники и витрина (не зависит от cwd). */
 public final class ProjectPaths {
 
     private ProjectPaths() {

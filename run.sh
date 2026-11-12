@@ -23,4 +23,4 @@ exec java \
     --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
     --add-opens=java.base/sun.security.action=ALL-UNNAMED \
     --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
-    -jar "$JAR" "$@"
+    -jar "$JAR"
