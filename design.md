@@ -189,7 +189,7 @@ flowchart TB
         J1["J1 - inner lookup по name_norm<br/>broadcast(D1)"]
         P3["P3 - collapse (player_id, season)<br/>TOT иначе sum по командам"]
         D3[("D3 stats<br/>1 строка на (player_id, season)")]
-        P4["P4 - salaries<br/>select колонок, фильтр периода<br/>drop null, salary больше нуля"]
+        P4["P4 - salaries<br/>select колонок<br/>drop null, salary больше нуля"]
         P5["P5 - sum(salary)<br/>по (player_id, season_end)"]
         D4[("D4 salaries<br/>1 строка на (player_id, season_end)")]
         J2["J2 - inner join<br/>player_id = player_id<br/>AND season = season_end<br/>broadcast(D4)"]
@@ -327,8 +327,8 @@ Spark CSV сопоставляет схему с файлом **по позиц�
 | 4 | `games` | int | `sum(G)` |
 | 5 | `salary` | long | `sum(salary)` |
 | 6 | `pts` | int | `sum(PTS)` |
-| 7 | `trb` | int | `sum(TRB)`, null → 0 |
-| 8 | `ast` | int | `sum(AST)`, null → 0 |
+| 7 | `trb` | int | `sum(TRB)` |
+| 8 | `ast` | int | `sum(AST)` |
 | 9 | `efficiency` | double | `salary / (pts + trb + ast)` |
 
 При записи `partitionBy("season")` колонка `season` физически не дублируется в файле.
@@ -434,14 +434,14 @@ Dataset<Row> collapsed = tot.unionByName(team)
          sum("G").as("games"), sum("PTS").as("pts"),
          sum("TRB").as("trb"), sum("AST").as("ast"));
 
-// null TRB/AST заменяются на 0 после проверки G/PTS
+// строки без G/PTS удаляются; null TRB/AST не заполняются
 Dataset<Row> stats = collapsed
-    .filter(col("games").isNotNull().and(col("pts").isNotNull()))
-    .withColumn("trb", coalesce(col("trb"), lit(0)))
-    .withColumn("ast", coalesce(col("ast"), lit(0)));
+    .filter(col("games").isNotNull().and(col("pts").isNotNull()));
 ```
 
-7. `TRB`/`AST` null → 0; строки без `games`/`pts` удаляются.
+7. Строки без `games`/`pts` удаляются; `TRB`/`AST` остаются nullable. Если `TRB` или `AST`
+   равны `null`, `production` тоже `null`, и строка отсекается фильтром `production > 0`
+   на этапе метрики.
 
 `distinct()` здесь — только построение множества TOT-ключей до свёртки; данные не
 дедуплицируются повторно. Anti-join гарантирует, что TOT-строка и строки команд не
@@ -453,8 +453,8 @@ Dataset<Row> stats = collapsed
 
 1. Чтение с `header=true` без `inferSchema`; `select` трёх колонок по именам;
    `season_end` → int, `salary` → long через `double`.
-2. Фильтр `season_end BETWEEN 1985 AND 2017`, непустые ключи (null и пустая строка),
-   `salary > 0`.
+2. Непустые ключи (null и пустая строка), `salary > 0`. Сезон не фильтруется здесь:
+   `inner join` со stats (1985–2017) сам отсекает лишние `season_end`.
 3. `groupBy(player_id, season_end).agg(sum(salary))` — ровно одна строка на ключ.
 4. `salary` остаётся `long`, пропуски не заполняются и не оцениваются.
 
@@ -629,9 +629,8 @@ Dataset<Row> result = dataset
    ключи и меры. Чтение без `inferSchema` — один проход, без отдельного прохода на
    определение типов.
 2. **Ранние фильтры.** Строки без ключей (players — `_id`/`name`, stats — `Player`/`Year`,
-   salaries — `player_id`/`season_end`), пустые строки stats, `Year` вне 1985–2017 и
-   `season_end=2018` отсекаются до нормализации и join; в salaries также `null`/пустой
-   `salary` и `salary <= 0`.
+   salaries — `player_id`/`season_end`), пустые строки stats, `Year` вне 1985–2017
+   отсекаются до нормализации и join; в salaries также `null`/пустой `salary` и `salary <= 0`.
 3. **Агрегация до join.** 16 606 → 13 617 и 13 612 → 13 237; join получает по одной строке
    на ключ, поэтому не размножает строки и не требует последующего `distinct`.
 4. **Broadcast-соединения.** `name_map` (4 596 строк) и salaries (13 237 строк)
@@ -658,7 +657,7 @@ Dataset<Row> result = dataset
 | Р-1 | Нормализация по ТЗ превращает акценты и нелатинские символы в пробелы: возможны коллизии имён и потери | на текущих данных не найдено 28 имён / 168 строк; 43 имени / 89 `_id` исключены, из них 30 имён / 326 строк со статистикой в периоде |
 | Р-2 | Сезоны 1987 и 1990 неполны в зарплатах | пропуски не заполняются; отсутствие зарплаты ≠ отсутствие контракта |
 | Р-3 | Зарплаты не приведены к инфляции | метрика сравнивается только внутри сезона; межсезонные сравнения запрещены |
-| Р-4 | `TRB`/`AST` null трактуются как 0 | на текущих данных замен 0 |
+| Р-4 | `TRB`/`AST` null не заменяются на 0 | `production` становится null, строка отсекается фильтром `production > 0` |
 | Р-5 | Физическая сортировка файла не является контрактом запроса | каждый запрос содержит `orderBy`; top-10 может использовать early-stop, но не обязан |
 | Р-6 | Полная перезапись корня удаляет всё в `data/player_season_efficiency` | путь считается принадлежащим сборке; это требование §6.2 |
 | Р-7 | `season` после чтения оказывается последней колонкой | запросы перечисляют колонки явно; проверяется набор, а не порядок |

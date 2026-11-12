@@ -10,10 +10,8 @@ import java.nio.file.Path;
 import java.util.Locale;
 
 import static org.apache.spark.sql.functions.broadcast;
-import static org.apache.spark.sql.functions.coalesce;
 import static org.apache.spark.sql.functions.col;
 import static org.apache.spark.sql.functions.length;
-import static org.apache.spark.sql.functions.lit;
 import static org.apache.spark.sql.functions.trim;
 
 /** Сборка: очистка каждого источника, J1 по имени, J2 с зарплатами, метрика и Parquet. */
@@ -43,11 +41,9 @@ public final class BuildJob {
                 .withColumn("name_norm", Names.normalizeName(col("Player")));
         Dataset<Row> named = normalized.join(broadcast(registry.nameMap), "name_norm");
 
-        // P3: TOT/team collapse, фильтр G/PTS, null TRB/AST -> 0.
+        // P3: TOT/team collapse, фильтр G/PTS.
         Dataset<Row> stats = StatsCollapse.collapse(named)
-                .filter(col("games").isNotNull().and(col("pts").isNotNull()))
-                .withColumn("trb", coalesce(col("trb"), lit(0L)))
-                .withColumn("ast", coalesce(col("ast"), lit(0L)));
+                .filter(col("games").isNotNull().and(col("pts").isNotNull()));
 
         // P4/P5: salaries -> очистка -> sum(salary) по (player_id, season_end).
         Dataset<Row> salaries = SalaryCollapse.collapse(
