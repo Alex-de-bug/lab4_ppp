@@ -8,7 +8,7 @@
 
 ## 1. Границы и инварианты
 
-В объёме: очистка трёх CSV, реестр имён с blacklist, два соединения, метрика, запись
+В объёме: очистка трёх CSV, реестр имён с исключением однофамильцев, два соединения, метрика, запись
 Parquet с партиционированием по сезону, явные запросы top/undervalued из `Main` с проверкой
 каталога сезонов и pruning. Вне объёма — инфляционная корректировка, ручное разрешение однофамильцев,
 инкрементальные обновления, Hive/метастор, UI (см. `tz.md` §11).
@@ -30,14 +30,14 @@ Parquet с партиционированием по сезону, явные з
 
 | # | Решение | Почему | Следствие |
 |---|---|---|---|
-| A1 | Связь stats → players только через `name_norm`; имена с `count(distinct _id) > 1` целиком в blacklist | в stats нет ID; угадывать игрока запрещено ТЗ | 43 имени / 89 `_id` исключены; 326 строк stats в периоде потеряны и залогированы |
+| A1 | Связь stats → players только через `name_norm`; имена с `count(distinct _id) > 1` исключаются целиком | в stats нет ID; угадывать игрока запрещено ТЗ | 43 имени / 89 `_id` исключены; 326 строк stats в периоде потеряны |
 | A2 | Агрегация каждой стороны **до** J2; после J2 — только метрика, фильтр и контрольный assert | иначе TOT/командные строки и трейды размножат join | 16 606 → 13 617 и 13 612 → 13 237 до join |
 | A3 | Оба соединения — broadcast малой стороны | стороны 4.6k / 13k строк; shuffle не нужен | `BroadcastHashJoin`, без sort-merge |
 | A4 | `repartition(col("season"))` → `sortWithinPartitions(season ASC, efficiency DESC, player_id ASC)` → `partitionBy("season")` | хеш-партиционирование не разрывает сезон между задачами; Spark при `partitionBy` требует порядок по partition-колонке и иначе добавляет свой `Sort`, теряя порядок файла | ровно один файл на сезон, внутри файла `efficiency DESC, player_id ASC` |
 | A5 | Полная статическая перезапись корня (`mode=overwrite`) | удаляет устаревшие партиции, повторный запуск идемпотентен | каталог сезонов всегда соответствует последней сборке |
 | A6 | Каталог сезонов — обход ФС; запрос читает корень и фильтрует литералом сезона | pruning без хардкода диапазона и без полного сканирования | читается один файл партиции |
 | A7 | Один shaded jar (Spark-зависимости включены), запуск через `run.sh` | `spark-submit` в окружении не установлен; запуск самодостаточен | jar ~300 МБ; `run.sh` добавляет Java 17 `--add-opens`; для `spark-submit` — Maven-профиль `spark-provided` |
-| A8 | `Main` без CLI: сезон, лимиты и `min_games` заданы константами | по требованию нужны явные запросы, а не парсинг аргументов | `./run.sh` без аргументов; смена параметров — правка констант `Main` |
+| A8 | `Main` без CLI: сезон и лимиты заданы константами | по требованию нужны явные запросы, а не парсинг аргументов | `./run.sh` без аргументов; смена параметров — правка констант `Main` |
 | A9 | CSV читается с `header=true` без `inferSchema`; нужные колонки — `select` по имени + `cast` | Spark CSV с навязанной `StructType` маппит поля по позиции, а не по имени: частичная схема прочитала бы первые N колонок файла | все поля приходят строками; типы задаются явными cast, лишние колонки не участвуют |
 
 ## 3. C4
@@ -88,12 +88,11 @@ C4Component
     Component(under, "UndervaluedQuery", "DataFrame API", "efficiency ASC, limit 5")
     Component(format, "OutputFormatter", "Java", "stdout/stderr")
     Component(readers, "Readers", "Spark CSV", "select нужных колонок")
-    Component(registry, "NameRegistry", "DataFrame API", "normalize_name, mapping и blacklist")
+    Component(registry, "NameRegistry", "DataFrame API", "normalize_name и однозначный mapping")
     Component(stats, "StatsCollapse", "DataFrame API", "J1 по name_norm, TOT или sum(team)")
     Component(sal, "SalaryCollapse", "DataFrame API", "Фильтр, sum(salary)")
     Component(join, "JoinAndMetric", "DataFrame API", "J2, assert, efficiency, production")
     Component(writer, "PartitionWriter", "Spark", "repartition, sort, overwrite")
-    Component(report, "BuildReport", "slf4j", "Счётчики раздела 9 ТЗ")
     ContainerDb_Ext(src, "Исходные CSV", "FS", "read-only")
     ContainerDb_Ext(ds, "Parquet-витрина", "local FS", "data/player_season_efficiency")
 
@@ -113,24 +112,20 @@ C4Component
     Rel(readers, registry, "players")
     Rel(readers, stats, "stats")
     Rel(readers, sal, "salaries")
-    Rel(registry, stats, "name_map, blacklist")
+    Rel(registry, stats, "name_map")
     Rel(stats, join, "уникальный ключ")
     Rel(sal, join, "уникальный ключ")
     Rel(join, writer, "готовые строки")
     Rel(writer, ds, "пишет", "Parquet")
-    Rel(registry, report, "счётчики")
-    Rel(stats, report, "счётчики")
-    Rel(join, report, "счётчики")
-    Rel(report, format, "stdout")
 ```
 
 Контракт компонентов: `Main` — единственный сценарий: `BuildJob.build(...)`, проверка
 каталога через `SeasonCatalog`, чтение корня и два явных DataFrame-запроса. `Readers` отдаёт три
-`Dataset<Row>` с уже спроецированными колонками; `NameRegistry` — два малых датасета
-(`name_map`, `blacklist`); `StatsCollapse` и `SalaryCollapse` — по одной строке на ключ;
+`Dataset<Row>` с уже спроецированными колонками; `NameRegistry` — один малый датасет
+`name_map` (неоднозначные имена отфильтрованы); `StatsCollapse` и `SalaryCollapse` —
+по одной строке на ключ;
 `JoinAndMetric` — финальные 9 колонок; `PartitionWriter` не знает ничего о происхождении
-данных. `BuildReport` — единственный потребитель счётчиков, собирает их до записи
-(датасеты кэшируются, чтобы не пересчитывать план).
+данных.
 
 ## 4. DFD
 
@@ -150,7 +145,7 @@ C4Component
 | ID | Процесс | Вход → выход |
 |---|---|---|
 | M0 | Main scenario | E1 → `BuildJob` → P8–P10 → stdout |
-| P1 | players registry | `players.csv` → `D1`, `D2` |
+| P1 | players registry | `players.csv` → `D1` |
 | P2 | stats clean | `Seasons_Stats.xls` → очищенные строки периода 1985–2017 |
 | J1 | name lookup | stats + `D1` → stats с `player_id` |
 | P3 | stats collapse | J1 → `D3` (TOT или сумма команд) |
@@ -168,7 +163,6 @@ C4Component
 | ID | Хранилище | Содержимое |
 |---|---|---|
 | D1 | `name_map` | `name_norm → player_id, player_name` без однофамильцев |
-| D2 | `blacklist` | `name_norm → [player_id]` для отчёта |
 | D3 | `stats` | одна строка на `(player_id, season)` |
 | D4 | `salaries` | одна строка на `(player_id, season_end)` |
 | D5 | Parquet-витрина | `season=YYYY/part-*.parquet`, 1 файл на сезон |
@@ -191,7 +185,6 @@ flowchart TB
         direction TB
         P1["P1 - players<br/>select(_id, name), drop пустых, normalize_name<br/>count(DISTINCT _id) по name_norm"]
         D1[("D1 name_map<br/>name_norm -> player_id, player_name")]
-        D2[("D2 blacklist<br/>name_norm -> список _id")]
         P2["P2 - stats<br/>select колонок, drop пустых, фильтр периода<br/>normalize_name"]
         J1["J1 - inner lookup по name_norm<br/>broadcast(D1)"]
         P3["P3 - collapse (player_id, season)<br/>TOT иначе sum по командам"]
@@ -203,14 +196,13 @@ flowchart TB
         P6["P6 - efficiency = salary / (pts + trb + ast)<br/>production больше нуля<br/>assert unique(player_id, season)"]
         P7["P7 - repartition(season)<br/>sortWithinPartitions(season, efficiency DESC, player_id ASC)<br/>write partitionBy(season), overwrite"]
         D5[("D5 витрина Parquet<br/>каталоги season=YYYY, 1 файл на сезон")]
-        R1["R1 build report<br/>счётчики раздела 9 ТЗ"]
     end
 
     subgraph QRY["Запросы - Main (без CLI)"]
         direction TB
         P8["P8 - каталог: season=YYYY и минимум 1 parquet<br/>проверка сезона 1991"]
-        P9["P9 - top-10<br/>read root (partition discovery)<br/>filter(season=1991, games>=20)<br/>row_number over(efficiency DESC, player_id ASC)<br/>orderBy + limit(10)"]
-        P10["P10 - undervalued-5<br/>filter(season=1991, games>=20)<br/>row_number over(efficiency ASC, player_id ASC)<br/>orderBy + limit(5)"]
+        P9["P9 - top-10<br/>read root (partition discovery)<br/>filter(season=1991)<br/>row_number over(efficiency DESC, player_id ASC)<br/>orderBy + limit(10)"]
+        P10["P10 - undervalued-5<br/>filter(season=1991)<br/>row_number over(efficiency ASC, player_id ASC)<br/>orderBy + limit(5)"]
         OUT["stdout: заголовки и строки<br/>rank, player_id, player_name,<br/>season, games, salary, pts, trb, ast, efficiency"]
     end
 
@@ -220,11 +212,10 @@ flowchart TB
     OUT -->|"stdout: две таблицы"| E1
     F2 --> P1
     P1 --> D1
-    P1 -.-> D2
     F1 --> P2
     D1 --> J1
     P2 --> J1
-    J1 -->|не найдено / blacklist исключены| P3
+    J1 -->|не найдено / неоднозначные имена исключены| P3
     P3 --> D3
     F3 --> P4
     P4 --> P5
@@ -239,24 +230,19 @@ flowchart TB
     P8 -->|сезон есть в каталоге| P10
     P9 --> OUT
     P10 --> OUT
-    D2 -.-> R1
-    P3 -.-> R1
-    J2 -.-> R1
-    P6 -.-> R1
 ```
 
-Сплошные стрелки — основные данные; пунктир — счётчики в отчёт. E1 запускает M0; M0
-вызывает `BuildJob` (P1–P7), затем P8–P10 и получает stdout. Значения `1991`, `20`, `5`
-и `10` — константы `Main`. На рёбрах показаны только правила отсечения, без фактических
-объёмов (они — в таблице 4.4). Порядок строго по ТЗ §4: сначала независимая очистка и
-агрегация каждой стороны, затем J2; J1 — это не join из §4.4, а lookup внутри подготовки
-stats (по §4.2).
+Сплошные стрелки — потоки данных. E1 запускает M0; M0 вызывает `BuildJob` (P1–P7),
+затем P8–P10 и получает stdout. Значения `1991`, `5` и `10` — константы `Main`. На рёбрах
+показаны только правила отсечения, без фактических объёмов (они — в таблице 4.4). Порядок
+строго по ТЗ §4: сначала независимая очистка и агрегация каждой стороны, затем J2; J1 —
+это не join из §4.4, а lookup внутри подготовки stats (по §4.2).
 
 ### 4.3. Где именно учтён дедуп
 
 | # | Датасет | Ключ | Правило | Почему так | Эффект на текущих данных |
 |---|---|---|---|---|---|
-| D-1 | players | `name_norm` | `count(DISTINCT _id)`; ровно 1 → mapping, больше 1 → blacklist целиком | в stats нет ID; выбор «наиболее вероятного» запрещён | 4 596 имён в mapping; 43 имени / 89 игроков в blacklist |
+| D-1 | players | `name_norm` | `count(DISTINCT _id)`; ровно 1 → mapping, больше 1 → имя исключается целиком | в stats нет ID; выбор «наиболее вероятного» запрещён | 4 596 имён в mapping; 43 имени / 89 игроков исключены |
 | D-2 | stats | `(player_id, season)` | если у пары есть `Tm = "TOT"` — берётся только TOT; иначе сумма строк команд | TOT уже является суммой команд, сложение = двойной учёт | 2 989 командных строк отброшено anti-join по TOT-ключам; 16 606 → 13 617 |
 | D-3 | salaries | `(player_id, season_end)` | `sum(salary)` | трейд разбивает выплату на несколько строк | 13 612 → 13 237; 375 строк свёрнуто |
 | D-4 | после J2 | `(player_id, season)` | assert `count = 1`, иначе сборка падает | join не должен размножать строки; `distinct` после join запрещён | 12 124 пары, дублей 0 |
@@ -273,7 +259,7 @@ stats (по §4.2).
 | строк в файле | 4 685 | 24 691 | 14 163 |
 | после удаления пустых строк | 4 685 | 24 624 (−67) | 14 163 |
 | после фильтра периода 1985–2017 | 4 685 | 17 100 | 13 612 (−551 за 2018) |
-| после имени / очистки | 4 596 имён в mapping; 43 в blacklist (89 `_id`) | 16 606 (−494: 326 blacklist + 168 не найдено) | 13 612 |
+| после имени / очистки | 4 596 имён в mapping; 43 имени исключены (89 `_id`) | 16 606 (−494: 326 неоднозначных + 168 не найдено) | 13 612 |
 | после дедупа/агрегации (вход J2) | — | 13 617 (1 строка на ключ) | 13 237 (1 строка на ключ) |
 | J2 (inner) | — | 12 124 (−1 493 без зарплаты) | 12 124 (−1 113 без статистики) |
 | `production <= 0` | — | −21 | — |
@@ -287,7 +273,7 @@ stats (по §4.2).
 
 ```text
 24 691 (файл) − 67 (пустые) − 7 524 (вне периода 1985–2017) = 17 100
-17 100 − 494 (имя не найдено / blacklist)                     = 16 606
+17 100 − 494 (имя не найдено / неоднозначное)                  = 16 606
 16 606 − 2 989 (командные строки, уже покрытые TOT)           = 13 617 пар
 13 617 − 1 493 (нет зарплаты за сезон)                        = 12 124
 12 124 − 21 (production <= 0)                                 = 12 103
@@ -323,7 +309,6 @@ Spark CSV сопоставляет схему с файлом **по позиц�
 | Датасет | Колонки | Уникальность |
 |---|---|---|
 | `name_map` | `name_norm string`, `player_id string`, `player_name string` | 1 строка на `name_norm` |
-| `blacklist` | `name_norm string`, `ids array<string>` | 1 строка на `name_norm` (только для отчёта) |
 | `stats` | `player_id string`, `player_name string` (константа на игрока), `season int`, `games long`, `pts long`, `trb long`, `ast long` | 1 строка на `(player_id, season)` |
 | `salaries` | `player_id string`, `season_end int`, `salary long` | 1 строка на `(player_id, season_end)` |
 | `joined` | те же ключи + `player_name`, `salary`, меры | 1 строка на `(player_id, season)` |
@@ -375,8 +360,8 @@ J2 соединяет уже сокращённые стороны: ключи `
 
 Сразу после проекции отбрасываются строки, у которых пусты ключевые поля: players —
 `_id`/`name`, stats — `Player`/`Year`, salaries — `player_id`/`season_end`/`salary`
-(и `salary <= 0`). Такие строки не доходят ни до J1, ни до J2 и не участвуют в отчёте о
-blacklist. Исключение — `G`/`PTS`: по §4.2.4 их проверка стоит после свёртки, потому что
+(и `salary <= 0`). Такие строки не доходят ни до J1, ни до J2. Исключение — `G`/`PTS`:
+по §4.2.4 их проверка стоит после свёртки, потому что
 строка с пустым `PTS` может нести валидные `TRB`/`AST`; раннее удаление исказило бы суммы.
 На текущих данных строк без `G`/`PTS` в периоде нет.
 
@@ -410,18 +395,15 @@ Dataset<Row> registry = players
     .groupBy("name_norm")
     .agg(countDistinct("player_id").as("id_count"),
          first("player_id").as("player_id"),
-         first("player_name").as("player_name"),
-         sort_array(collect_set("player_id")).as("ids"));
+         first("player_name").as("player_name"));
 
-Dataset<Row> nameMap  = registry.filter(col("id_count").equalTo(1))
-                                .select("name_norm", "player_id", "player_name");
-Dataset<Row> blacklist = registry.filter(col("id_count").greaterThan(1))
-                                 .select("name_norm", "ids");
+Dataset<Row> nameMap = registry.filter(col("id_count").equalTo(1))
+                               .select("name_norm", "player_id", "player_name");
 ```
 
 `first(...)` безопасен: в текущих данных один `_id` = одна строка; повторяющиеся строки
-одного `_id` не влияют на `countDistinct`. Blacklist содержит все 43 имени и полный список
-`_id`; при отчёте к нему присоединяются счётчики строк stats по `name_norm`.
+одного `_id` не влияют на `countDistinct`. Имена с `id_count > 1` не попадают в
+`name_map` и исключаются на J1; отдельный датасет исключённых имён не строится.
 
 ### 6.3. Stats: проекция, фильтры, J1, свёртка
 
@@ -431,8 +413,7 @@ Dataset<Row> blacklist = registry.filter(col("id_count").greaterThan(1))
    `Year`, поэтому отдельный проход по всем колонкам не нужен.
 3. Фильтр `Year BETWEEN 1985 AND 2017`; `season = Year.cast(int)`.
 4. `name_norm = normalize_name(Player)`; `inner` join с `broadcast(name_map)` по `name_norm`.
-   Строки без совпадения и blacklist отсекаются здесь; blacklist-строки отдельно считаются
-   для отчёта join-ом исходного stats по `name_norm` с blacklist.
+   Строки без совпадения и с неоднозначным именем отсекаются здесь.
 5. Меры приводятся к `long` (nullable): `G`/`PTS` не фильтруются до свёртки — правило
    «удалить строки без `G`/`PTS`» применяется после неё, как в §4.2.4.
 6. Свёртка до `(player_id, season)`:
@@ -453,14 +434,14 @@ Dataset<Row> collapsed = tot.unionByName(team)
          sum("G").as("games"), sum("PTS").as("pts"),
          sum("TRB").as("trb"), sum("AST").as("ast"));
 
-// null TRB/AST считаются до замены и попадают в отчёт
+// null TRB/AST заменяются на 0 после проверки G/PTS
 Dataset<Row> stats = collapsed
     .filter(col("games").isNotNull().and(col("pts").isNotNull()))
     .withColumn("trb", coalesce(col("trb"), lit(0)))
     .withColumn("ast", coalesce(col("ast"), lit(0)));
 ```
 
-7. `TRB`/`AST` null → 0 (число замен логируется); строки без `games`/`pts` удаляются.
+7. `TRB`/`AST` null → 0; строки без `games`/`pts` удаляются.
 
 `distinct()` здесь — только построение множества TOT-ключей до свёртки; данные не
 дедуплицируются повторно. Anti-join гарантирует, что TOT-строка и строки команд не
@@ -490,7 +471,7 @@ Dataset<Row> joined = stats.as("s")
 ```
 
 Отдельного фильтра «без зарплаты» после J1 нет: J2 — `inner join`, и именно он отсекает
-такие пары (в отчёте — `no_salary`). Фильтровать игрока целиком после J1 нельзя: зарплата
+такие пары. Фильтровать игрока целиком после J1 нельзя: зарплата
 задана на `(player_id, season)`, и игрок может иметь контракт в других сезонах. Ранний
 semi-join по зарплатным ключам дал бы тот же результат, но это второй проход по тем же
 данным и нарушение порядка «сначала агрегация stats, затем join с salaries».
@@ -503,8 +484,8 @@ lookup вместо одного. Фильтр на уровне игрока т
 имел бы смысл при shuffle/sort-merge join и больших объёмах, но не при 13k строк и
 broadcast.
 
-Перед метрикой — assert уникальности одним действием (`joined` кэшируется, чтобы assert,
-отчёт и метрика не пересчитывали план):
+Перед метрикой — assert уникальности одним действием (`joined` кэшируется, чтобы assert
+и метрика не пересчитывали план):
 
 ```java
 long dup = joined.groupBy("player_id", "season").count()
@@ -558,28 +539,6 @@ result.repartition(col("season"))
 - AQE может укрупнить партиции, но не разрывает одинаковые ключи между задачами; на
   «один файл на сезон» это не влияет.
 
-### 6.8. Отчёт сборки
-
-Счётчики собираются по кэшированным датасетам до записи, выводятся в stdout/slf4j.
-Формат строк — стабильные префиксы, чтобы отчёт можно было проверить скриптом:
-
-```text
-[players]  rows=4685 (unique _id=4685); names=4639; mapping=4596; blacklist=43 names / 89 ids
-[stats]    rows=24691 -> 24624 (empty) -> 17100 (period) -> 16606 (named) -> 13617 keys
-[named]    matched_rows=16606; not_found=168 rows / 28 names; blacklist=326 rows / 30 names
-[blacklist] name_norm=...; ids=[...]; stats_rows=N        # по строке на имя
-[salaries] rows=14163 -> 13612 (period) -> 13237 keys
-[join]     stats_keys=13617; salary_keys=13237; joined=12124; no_salary=1493; no_stats=1113; dupes=0
-[cleanup]  null_trb_replaced=0; null_ast_replaced=0; dropped_no_g_or_pts=0
-[metric]   production<=0 dropped=21
-[result]   rows=12103; seasons=33
-```
-
-Обязательные по §9 поля: строки до/после очистки и после агрегации по каждому датасету;
-число уникальных ключей на входе join; сопоставлено/не найдено/blacklist (с `name_norm`,
-`_id` и числом исключённых строк); исключено из-за отсутствия зарплаты; пары зарплат без
-статистики; TRB/AST null → 0; `production <= 0`; строки и сезоны результата.
-
 ## 7. Запросы в Main
 
 ### 7.1. Сценарий и фиксированные параметры
@@ -589,7 +548,6 @@ CLI отсутствует: `Main` вызывает сборку и затем �
 | Параметр | Значение | Где задан |
 |---|---:|---|
 | `season` | 1991 | `Main.SEASON` |
-| `min_games` | 20 | `Main.MIN_GAMES` |
 | top limit | 10 | `Main.TOP_LIMIT` |
 | undervalued limit | 5 | `Main.UNDERVALUED_LIMIT` |
 | корень витрины | `<project>/data/player_season_efficiency` | `ProjectPaths.projectRoot()` |
@@ -610,8 +568,7 @@ CLI отсутствует: `Main` вызывает сборку и затем �
 3. Список пуст → `датасет пуст: <path>`.
 4. Сезона 1991 нет → `сезон 1991 отсутствует в каталоге; доступные сезоны: ...`
    (по возрастанию).
-5. Найден → читаем корень; фильтр `games >= min_games` может дать 0 строк — это успех,
-   заголовок + предупреждение в stderr.
+5. Найден → читаем корень и выводим оба результата.
 
 Проверка каталога не запускает Spark-job: это ~33 операции обхода ФС, что дешевле
 валидации через чтение датасета. Гонка «каталог удалён между проверкой и чтением» —
@@ -637,7 +594,7 @@ WindowSpec window = Window.partitionBy(col("season"))
         .orderBy(col("efficiency").desc(), col("player_id").asc());
 
 Dataset<Row> result = dataset
-        .filter(col("season").equalTo(SEASON).and(col("games").geq(MIN_GAMES)))
+        .filter(col("season").equalTo(SEASON))
         .withColumn("rank", row_number().over(window))
         .select(col("rank"), col("player_id"), col("player_name"), col("season"),
                 col("games"), col("salary"), col("pts"), col("trb"), col("ast"),
@@ -660,9 +617,8 @@ Dataset<Row> result = dataset
 - `salary` — целое, `efficiency` — `%.6f` (округление только на выводе; в Parquet значение
   не округляется). Форматирование — через `Locale.ROOT`, чтобы в русской локали не
   появилась десятичная запятая.
-- stderr: предупреждения `найдено M < N кандидатов` или `нет кандидатов` (при 0 строк
-  после `min_games` заголовок всё равно печатается). Ошибки сборки/запроса `Main` печатает
-  в stderr и завершает процесс с кодом 1.
+- stderr: предупреждения `найдено M < N кандидатов` или `нет кандидатов`. Ошибки
+  сборки/запроса `Main` печатает в stderr и завершает процесс с кодом 1.
 - Spark-логи приглушаются до WARN, чтобы stdout оставался читаемым.
 
 ## 8. Почему путь данных оптимален
@@ -693,16 +649,16 @@ Dataset<Row> result = dataset
    читается один файл (~370 строк на сезон); `orderBy` сортирует только эту партицию,
    `limit` ограничивает вывод. Валидация сезона не требует Spark-job.
 9. **Один проход по каждому источнику.** Каждый файл читается один раз; промежуточные
-   датасеты кэшируются для отчёта и переиспользуются в join, повторных чтений нет.
+   датасеты переиспользуются в join, повторных чтений нет.
 
 ## 9. Риски и ограничения
 
 | # | Риск | Митигация / следствие |
 |---|---|---|
-| Р-1 | Нормализация по ТЗ превращает акценты и нелатинские символы в пробелы: возможны коллизии имён и потери | на текущих данных не найдено 28 имён / 168 строк; blacklist 43 имени / 89 `_id`, из них 30 имён / 326 строк со статистикой в периоде; всё считается в отчёте |
+| Р-1 | Нормализация по ТЗ превращает акценты и нелатинские символы в пробелы: возможны коллизии имён и потери | на текущих данных не найдено 28 имён / 168 строк; 43 имени / 89 `_id` исключены, из них 30 имён / 326 строк со статистикой в периоде |
 | Р-2 | Сезоны 1987 и 1990 неполны в зарплатах | пропуски не заполняются; отсутствие зарплаты ≠ отсутствие контракта |
 | Р-3 | Зарплаты не приведены к инфляции | метрика сравнивается только внутри сезона; межсезонные сравнения запрещены |
-| Р-4 | `TRB`/`AST` null трактуются как 0 | число замен в отчёте; на текущих данных 0 |
+| Р-4 | `TRB`/`AST` null трактуются как 0 | на текущих данных замен 0 |
 | Р-5 | Физическая сортировка файла не является контрактом запроса | каждый запрос содержит `orderBy`; top-10 может использовать early-stop, но не обязан |
 | Р-6 | Полная перезапись корня удаляет всё в `data/player_season_efficiency` | путь считается принадлежащим сборке; это требование §6.2 |
 | Р-7 | `season` после чтения оказывается последней колонкой | запросы перечисляют колонки явно; проверяется набор, а не порядок |
@@ -727,17 +683,16 @@ find data/player_season_efficiency -name '*.parquet' | wc -l   # 33
 | # | Критерий | Чем обеспечен |
 |---:|---|---|
 | 1 | 33 партиции, по одному файлу | repartition(season) + partitionBy; проверка `find` |
-| 2 | идемпотентность | статическая перезапись корня; повторный запуск и сравнение отчёта |
+| 2 | идемпотентность | статическая перезапись корня; повторный запуск и сравнение строк |
 | 3 | `season` без схемы при чтении корня | partition discovery, `spark.read.parquet(root)` |
 | 4 | ровно 9 колонок | финальный `select`, assert схемы до записи |
 | 5 | дедуп до join, нет пост-join преобразований | D-2/D-3; после J2 только метрика/фильтр, плюс контрольный assert D-4 (не меняет данные) |
 | 6 | `efficiency = salary / production` (±1e-9) | P6; сверка независимым запросом |
 | 7 | N строк, порядок, сезон, тай-брейк | `orderBy(efficiency, player_id)`, `limit` |
 | 8 | `PartitionFilters` и один файл | фиксированный литерал `1991`; `executedPlan()` при проверке |
-| 9 | нет сезона ≠ нет кандидатов | `validateSeason` + разные сообщения; пустой результат после `min_games` — предупреждение |
+| 9 | нет сезона ≠ нет кандидатов | `validateSeason` + разные сообщения; пустой результат — предупреждение |
 | 10 | запуск не зависит от cwd | `ProjectPaths.projectRoot()` для исходников и витрины |
 | 11 | физический порядок в файле | `sortWithinPartitions`; последовательное чтение одной партиции |
-| 12 | отчёт §9 | BuildReport, поля перечислены в 6.8 |
 
 ## 11. Структура проекта (предлагаемая)
 
@@ -752,12 +707,11 @@ src/main/java/ru/ppp/lab4/
   common/Spark.java                      # SparkSession (local[*])
   build/BuildJob.java                    # оркестрация P1-P7
   build/Readers.java                     # 3 CSV: header=true, select по имени, cast
-  build/NameRegistry.java                # D1/D2
+  build/NameRegistry.java                # D1: name_norm -> player_id
   build/StatsCollapse.java               # J1, TOT/team
   build/SalaryCollapse.java              # очистка и sum
   build/JoinAndMetric.java               # J2, assert, efficiency
   build/PartitionWriter.java             # repartition/sort/overwrite
-  build/BuildReport.java                 # счётчики §9
 ```
 
 Компоненты C4 соответствуют пакетам/классам один-к-одному; мелкие утилиты (`Names`,

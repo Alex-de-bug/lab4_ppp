@@ -25,7 +25,6 @@ import static org.apache.spark.sql.functions.row_number;
 public final class Main {
 
     private static final int SEASON = 1991;
-    private static final int MIN_GAMES = 20;
     private static final int TOP_LIMIT = 10;
     private static final int UNDERVALUED_LIMIT = 5;
 
@@ -96,8 +95,7 @@ public final class Main {
                         col("efficiency"))
                 .orderBy(col("efficiency").desc(), col("player_id").asc())
                 .limit(TOP_LIMIT);
-        System.out.println("Топ " + TOP_LIMIT + " по эффективности, сезон " + SEASON
-                + " (games >= " + MIN_GAMES + ")");
+        System.out.println("Топ " + TOP_LIMIT + " по эффективности, сезон " + SEASON);
         printRows(result.collectAsList(), TOP_LIMIT);
         System.out.println();
     }
@@ -107,15 +105,14 @@ public final class Main {
         WindowSpec window = Window.partitionBy(col("season"))
                 .orderBy(col("efficiency").asc(), col("player_id").asc());
         Dataset<Row> result = dataset
-                .filter(col("season").equalTo(SEASON).and(col("games").geq(MIN_GAMES)))
+                .filter(col("season").equalTo(SEASON))
                 .withColumn("rank", row_number().over(window))
                 .select(col("rank"), col("player_id"), col("player_name"), col("season"),
                         col("games"), col("salary"), col("pts"), col("trb"), col("ast"),
                         col("efficiency"))
                 .orderBy(col("efficiency").asc(), col("player_id").asc())
                 .limit(UNDERVALUED_LIMIT);
-        System.out.println("Топ " + UNDERVALUED_LIMIT + " недооценённых, сезон " + SEASON
-                + " (games >= " + MIN_GAMES + ")");
+        System.out.println("Топ " + UNDERVALUED_LIMIT + " недооценённых, сезон " + SEASON);
         printRows(result.collectAsList(), UNDERVALUED_LIMIT);
     }
 

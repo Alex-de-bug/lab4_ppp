@@ -5,23 +5,19 @@ import org.apache.spark.sql.Row;
 import ru.ppp.lab4.common.Names;
 
 import static org.apache.spark.sql.functions.col;
-import static org.apache.spark.sql.functions.collect_set;
 import static org.apache.spark.sql.functions.countDistinct;
 import static org.apache.spark.sql.functions.first;
-import static org.apache.spark.sql.functions.sort_array;
 
 /**
- * D1/D2: name_norm -> player_id для однозначных имён; имена с несколькими _id целиком
- * уходят в blacklist. Повторные строки одного _id неоднозначности не создают.
+ * name_norm -> player_id только для однозначных имён. Имена с несколькими _id
+ * целиком исключаются: чёрный список как отдельный датасет больше не нужен.
  */
 public final class NameRegistry {
 
     public final Dataset<Row> nameMap;
-    public final Dataset<Row> blacklist;
 
-    private NameRegistry(Dataset<Row> nameMap, Dataset<Row> blacklist) {
+    private NameRegistry(Dataset<Row> nameMap) {
         this.nameMap = nameMap;
-        this.blacklist = blacklist;
     }
 
     public static NameRegistry build(Dataset<Row> cleanedPlayers) {
@@ -34,15 +30,11 @@ public final class NameRegistry {
                 .agg(
                         countDistinct("player_id").as("id_count"),
                         first("player_id").as("player_id"),
-                        first("player_name").as("player_name"),
-                        sort_array(collect_set("player_id")).as("ids"));
+                        first("player_name").as("player_name"));
 
         Dataset<Row> nameMap = registry
                 .filter(col("id_count").equalTo(1))
                 .select("name_norm", "player_id", "player_name");
-        Dataset<Row> blacklist = registry
-                .filter(col("id_count").gt(1))
-                .select("name_norm", "ids");
-        return new NameRegistry(nameMap, blacklist);
+        return new NameRegistry(nameMap);
     }
 }
