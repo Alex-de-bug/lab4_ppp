@@ -3,6 +3,8 @@ package ru.ppp.lab4;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.expressions.Window;
+import org.apache.spark.sql.expressions.WindowSpec;
 import ru.ppp.lab4.build.BuildJob;
 import ru.ppp.lab4.common.ProjectPaths;
 import ru.ppp.lab4.common.SeasonCatalog;
@@ -12,6 +14,9 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
 import java.util.stream.Collectors;
+
+import static org.apache.spark.sql.functions.col;
+import static org.apache.spark.sql.functions.row_number;
 
 /**
  * Явный сценарий без CLI: собрать витрину из трёх CSV и выполнить оба запроса ТЗ
@@ -50,10 +55,9 @@ public final class Main {
 
             validateSeason(data);
             Dataset<Row> dataset = spark.read().parquet(data.toString());
-            dataset.createOrReplaceTempView("player_season_efficiency");
 
-            printTop(spark);
-            printUndervalued(spark);
+            printTop(dataset);
+            printUndervalued(dataset);
         } finally {
             spark.stop();
         }
@@ -81,30 +85,38 @@ public final class Main {
     }
 
     /** ТЗ §7.2: топ по большей эффективности, при равенстве — player_id ASC. */
-    private static void printTop(SparkSession spark) {
-        String sql = "SELECT ROW_NUMBER() OVER (ORDER BY efficiency DESC, player_id ASC) AS `rank`,"
-                + " player_id, player_name, season, games, salary, pts, trb, ast, efficiency"
-                + " FROM player_season_efficiency"
-                + " WHERE season = " + SEASON + " AND games >= " + MIN_GAMES
-                + " ORDER BY efficiency DESC, player_id ASC"
-                + " LIMIT " + TOP_LIMIT;
+    private static void printTop(Dataset<Row> dataset) {
+        WindowSpec window = Window.partitionBy(col("season"))
+                .orderBy(col("efficiency").desc(), col("player_id").asc());
+        Dataset<Row> result = dataset
+                .filter(col("season").equalTo(SEASON).and(col("games").geq(MIN_GAMES)))
+                .withColumn("rank", row_number().over(window))
+                .select(col("rank"), col("player_id"), col("player_name"), col("season"),
+                        col("games"), col("salary"), col("pts"), col("trb"), col("ast"),
+                        col("efficiency"))
+                .orderBy(col("efficiency").desc(), col("player_id").asc())
+                .limit(TOP_LIMIT);
         System.out.println("Топ " + TOP_LIMIT + " по эффективности, сезон " + SEASON
                 + " (games >= " + MIN_GAMES + ")");
-        printRows(spark.sql(sql).collectAsList(), TOP_LIMIT);
+        printRows(result.collectAsList(), TOP_LIMIT);
         System.out.println();
     }
 
     /** ТЗ §7.3: топ недооценённых, при равенстве — player_id ASC. */
-    private static void printUndervalued(SparkSession spark) {
-        String sql = "SELECT ROW_NUMBER() OVER (ORDER BY efficiency ASC, player_id ASC) AS `rank`,"
-                + " player_id, player_name, season, games, salary, pts, trb, ast, efficiency"
-                + " FROM player_season_efficiency"
-                + " WHERE season = " + SEASON + " AND games >= " + MIN_GAMES
-                + " ORDER BY efficiency ASC, player_id ASC"
-                + " LIMIT " + UNDERVALUED_LIMIT;
+    private static void printUndervalued(Dataset<Row> dataset) {
+        WindowSpec window = Window.partitionBy(col("season"))
+                .orderBy(col("efficiency").asc(), col("player_id").asc());
+        Dataset<Row> result = dataset
+                .filter(col("season").equalTo(SEASON).and(col("games").geq(MIN_GAMES)))
+                .withColumn("rank", row_number().over(window))
+                .select(col("rank"), col("player_id"), col("player_name"), col("season"),
+                        col("games"), col("salary"), col("pts"), col("trb"), col("ast"),
+                        col("efficiency"))
+                .orderBy(col("efficiency").asc(), col("player_id").asc())
+                .limit(UNDERVALUED_LIMIT);
         System.out.println("Топ " + UNDERVALUED_LIMIT + " недооценённых, сезон " + SEASON
                 + " (games >= " + MIN_GAMES + ")");
-        printRows(spark.sql(sql).collectAsList(), UNDERVALUED_LIMIT);
+        printRows(result.collectAsList(), UNDERVALUED_LIMIT);
     }
 
     private static void printRows(List<Row> rows, int requested) {

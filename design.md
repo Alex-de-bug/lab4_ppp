@@ -64,7 +64,7 @@ C4Container
     Person(analyst, "Аналитик", "Запускает сценарий")
     System_Ext(src, "Исходные CSV", "read-only")
     Container_Boundary(sys, "NBA efficiency mart") {
-        Container(main, "Main", "Java 17 + Spark 3.5", "Сборка, проверка каталога, два SQL-запроса, вывод")
+        Container(main, "Main", "Java 17 + Spark 3.5", "Сборка, проверка каталога, два DataFrame-запроса, вывод")
         Container(build, "BuildJob", "Java 17 + Spark 3.5", "Очистка, дедуп, J1/J2, метрика, запись Parquet")
         ContainerDb(ds, "Parquet-витрина", "local FS", "season=YYYY/part-*.parquet")
     }
@@ -83,15 +83,15 @@ C4Component
     Component(main, "Main", "Java", "build + top-5 + undervalued-10")
     Component(build, "BuildJob", "Spark", "P1-P7")
     Component(catalog, "SeasonCatalog", "java.nio", "season=YYYY + parquet")
-    Component(view, "DatasetView", "Spark", "read root, temp view")
-    Component(top, "TopNQuery", "Spark SQL", "efficiency DESC, LIMIT 5")
-    Component(under, "UndervaluedQuery", "Spark SQL", "efficiency ASC, LIMIT 10")
+    Component(view, "DatasetView", "Spark", "read root")
+    Component(top, "TopNQuery", "DataFrame API", "efficiency DESC, limit 5")
+    Component(under, "UndervaluedQuery", "DataFrame API", "efficiency ASC, limit 10")
     Component(format, "OutputFormatter", "Java", "stdout/stderr")
     Component(readers, "Readers", "Spark CSV", "select нужных колонок")
-    Component(registry, "NameRegistry", "Spark SQL", "normalize_name, mapping и blacklist")
-    Component(stats, "StatsCollapse", "Spark SQL", "J1 по name_norm, TOT или sum(team)")
-    Component(sal, "SalaryCollapse", "Spark SQL", "Фильтр, sum(salary)")
-    Component(join, "JoinAndMetric", "Spark SQL", "J2, assert, efficiency, production")
+    Component(registry, "NameRegistry", "DataFrame API", "normalize_name, mapping и blacklist")
+    Component(stats, "StatsCollapse", "DataFrame API", "J1 по name_norm, TOT или sum(team)")
+    Component(sal, "SalaryCollapse", "DataFrame API", "Фильтр, sum(salary)")
+    Component(join, "JoinAndMetric", "DataFrame API", "J2, assert, efficiency, production")
     Component(writer, "PartitionWriter", "Spark", "repartition, sort, overwrite")
     Component(report, "BuildReport", "slf4j", "Счётчики раздела 9 ТЗ")
     ContainerDb_Ext(src, "Исходные CSV", "FS", "read-only")
@@ -104,8 +104,8 @@ C4Component
     Rel(main, under, "undervalued-10")
     Rel(main, ds, "partition discovery", "Parquet")
     Rel(catalog, view, "сезон валиден")
-    Rel(view, top, "temp view")
-    Rel(view, under, "temp view")
+    Rel(view, top, "Dataset<Row>")
+    Rel(view, under, "Dataset<Row>")
     Rel(top, format, "rank + строки")
     Rel(under, format, "rank + строки")
     Rel(build, readers, "читает три CSV")
@@ -125,7 +125,7 @@ C4Component
 ```
 
 Контракт компонентов: `Main` — единственный сценарий: `BuildJob.build(...)`, проверка
-каталога через `SeasonCatalog`, чтение корня и два явных SQL. `Readers` отдаёт три
+каталога через `SeasonCatalog`, чтение корня и два явных DataFrame-запроса. `Readers` отдаёт три
 `Dataset<Row>` с уже спроецированными колонками; `NameRegistry` — два малых датасета
 (`name_map`, `blacklist`); `StatsCollapse` и `SalaryCollapse` — по одной строке на ключ;
 `JoinAndMetric` — финальные 9 колонок; `PartitionWriter` не знает ничего о происхождении
@@ -209,8 +209,8 @@ flowchart TB
     subgraph QRY["Запросы - Main (без CLI)"]
         direction TB
         P8["P8 - каталог: season=YYYY и минимум 1 parquet<br/>проверка сезона 1991"]
-        P9["P9 - top-5<br/>read root (partition discovery)<br/>WHERE season = 1991 AND games >= 20<br/>ORDER BY efficiency DESC, player_id ASC<br/>LIMIT 5"]
-        P10["P10 - undervalued-10<br/>WHERE season = 1991 AND games >= 20<br/>ORDER BY efficiency ASC, player_id ASC<br/>LIMIT 10"]
+        P9["P9 - top-5<br/>read root (partition discovery)<br/>filter(season=1991, games>=20)<br/>row_number over(efficiency DESC, player_id ASC)<br/>orderBy + limit(5)"]
+        P10["P10 - undervalued-10<br/>filter(season=1991, games>=20)<br/>row_number over(efficiency ASC, player_id ASC)<br/>orderBy + limit(10)"]
         OUT["stdout: заголовки и строки<br/>rank, player_id, player_name,<br/>season, games, salary, pts, trb, ast, efficiency"]
     end
 
@@ -620,33 +620,37 @@ CLI отсутствует: `Main` вызывает сборку и затем �
 ### 7.3. Чтение и pruning
 
 ```java
-Dataset<Row> ds = spark.read().parquet(root);        // только корень, без basePath
-ds.createOrReplaceTempView("player_season_efficiency");
+Dataset<Row> dataset = spark.read().parquet(root);   // только корень, без basePath
 ```
 
 `season` восстанавливается из имён каталогов (тип int). Ручное перечисление сезонов,
 чтение `season=YYYY` напрямую и схема с объявленным `season` запрещены. Фильтр сезона —
-целочисленный литерал `1991` в SQL, поэтому Catalyst формирует
+`filter(col("season").equalTo(1991))` с константой, поэтому Catalyst формирует
 `PartitionFilters: ... (season = 1991)`. План можно вывести через
 `queryExecution().executedPlan()` при проверке; в обычном выводе он не печатается, stdout
 остаётся данными. Проверка: в плане `FileScan parquet` один файл партиции.
 
-### 7.4. SQL top-N
+### 7.4. DataFrame API top-N
 
-```sql
-SELECT ROW_NUMBER() OVER (ORDER BY efficiency {DESC|ASC}, player_id ASC) AS rank,
-       player_id, player_name, season, games, salary, pts, trb, ast, efficiency
-FROM player_season_efficiency
-WHERE season = {season} AND games >= {min_games}
-ORDER BY efficiency {DESC|ASC}, player_id ASC
-LIMIT {limit}
+```java
+WindowSpec window = Window.partitionBy(col("season"))
+        .orderBy(col("efficiency").desc(), col("player_id").asc());
+
+Dataset<Row> result = dataset
+        .filter(col("season").equalTo(SEASON).and(col("games").geq(MIN_GAMES)))
+        .withColumn("rank", row_number().over(window))
+        .select(col("rank"), col("player_id"), col("player_name"), col("season"),
+                col("games"), col("salary"), col("pts"), col("trb"), col("ast"),
+                col("efficiency"))
+        .orderBy(col("efficiency").desc(), col("player_id").asc())
+        .limit(TOP_LIMIT);
 ```
 
-`DESC` для top-5, `ASC` для undervalued-10; это две явные SQL-строки в `Main`. Тай-брейк
-`player_id ASC` делает порядок детерминированным. Окно считается по уже отфильтрованному
-набору (≤ одной партиции), `LIMIT` ограничивает вывод. В SQL подставляются только
-`int`-константы `Main`, поэтому интерполяция безопасна и не мешает pruning. Никакой запрос
-не полагается на физический порядок файла.
+Для undervalued те же шаги с `orderBy(efficiency.asc(), player_id.asc())` и
+`UNDERVALUED_LIMIT`. Тай-брейк `player_id` делает порядок детерминированным. Окно
+партиционировано по `season` (после фильтра он константен) и считается по уже
+отфильтрованному набору; `limit` ограничивает вывод. SQL и temp view не используются.
+Никакой запрос не полагается на физический порядок файла: явный `orderBy` обязателен.
 
 ### 7.5. Вывод
 
@@ -686,8 +690,8 @@ LIMIT {limit}
 7. **Запись без лишних файлов.** Хеш-партиционирование по сезону + `partitionBy` даёт ровно
    33 файла (по одному на сезон) и полную перезапись корня.
 8. **Запрос без полного сканирования.** Каталог — обход ФС, затем pruning по `season`:
-   читается один файл (~370 строк на сезон); `ORDER BY` сортирует только эту партицию,
-   `LIMIT` ограничивает вывод. Валидация сезона не требует Spark-job.
+   читается один файл (~370 строк на сезон); `orderBy` сортирует только эту партицию,
+   `limit` ограничивает вывод. Валидация сезона не требует Spark-job.
 9. **Один проход по каждому источнику.** Каждый файл читается один раз; промежуточные
    датасеты кэшируются для отчёта и переиспользуются в join, повторных чтений нет.
 
@@ -699,7 +703,7 @@ LIMIT {limit}
 | Р-2 | Сезоны 1987 и 1990 неполны в зарплатах | пропуски не заполняются; отсутствие зарплаты ≠ отсутствие контракта |
 | Р-3 | Зарплаты не приведены к инфляции | метрика сравнивается только внутри сезона; межсезонные сравнения запрещены |
 | Р-4 | `TRB`/`AST` null трактуются как 0 | число замен в отчёте; на текущих данных 0 |
-| Р-5 | Физическая сортировка файла не является контрактом запроса | каждый запрос содержит `ORDER BY`; top-5 может использовать early-stop, но не обязан |
+| Р-5 | Физическая сортировка файла не является контрактом запроса | каждый запрос содержит `orderBy`; top-5 может использовать early-stop, но не обязан |
 | Р-6 | Полная перезапись корня удаляет всё в `data/player_season_efficiency` | путь считается принадлежащим сборке; это требование §6.2 |
 | Р-7 | `season` после чтения оказывается последней колонкой | запросы перечисляют колонки явно; проверяется набор, а не порядок |
 | Р-8 | Добавленный вручную каталог `season=YYYY` меняет каталог сезонов | это требуемое поведение §6.2.5; некорректный шаблон игнорируется |
@@ -727,8 +731,8 @@ find data/player_season_efficiency -name '*.parquet' | wc -l   # 33
 | 3 | `season` без схемы при чтении корня | partition discovery, `spark.read.parquet(root)` |
 | 4 | ровно 9 колонок | финальный `select`, assert схемы до записи |
 | 5 | дедуп до join, нет пост-join преобразований | D-2/D-3; после J2 только метрика/фильтр, плюс контрольный assert D-4 (не меняет данные) |
-| 6 | `efficiency = salary / production` (±1e-9) | P6; сверка SQL-выражением |
-| 7 | N строк, порядок, сезон, тай-брейк | SQL `ORDER BY … , player_id`, `LIMIT` |
+| 6 | `efficiency = salary / production` (±1e-9) | P6; сверка независимым запросом |
+| 7 | N строк, порядок, сезон, тай-брейк | `orderBy(efficiency, player_id)`, `limit` |
 | 8 | `PartitionFilters` и один файл | фиксированный литерал `1991`; `executedPlan()` при проверке |
 | 9 | нет сезона ≠ нет кандидатов | `validateSeason` + разные сообщения; пустой результат после `min_games` — предупреждение |
 | 10 | запуск не зависит от cwd | `ProjectPaths.projectRoot()` для исходников и витрины |
