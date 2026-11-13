@@ -13,6 +13,7 @@ import static org.apache.spark.sql.functions.broadcast;
 import static org.apache.spark.sql.functions.col;
 import static org.apache.spark.sql.functions.length;
 import static org.apache.spark.sql.functions.trim;
+import static org.apache.spark.sql.functions.sum;
 
 /** Сборка: очистка каждого источника, J1 по имени, J2 с зарплатами, метрика и Parquet. */
 public final class BuildJob {
@@ -46,13 +47,14 @@ public final class BuildJob {
                 .filter(col("games").isNotNull().and(col("pts").isNotNull()));
 
         // P4/P5: salaries -> очистка -> sum(salary) по (player_id, season_end).
-        Dataset<Row> salaries = SalaryCollapse.collapse(
+        Dataset<Row> salaries = 
                 Readers.salaries(spark, salariesPath.toString())
                         .filter(col("player_id").isNotNull()
                                 .and(length(trim(col("player_id"))).gt(0))
                                 .and(col("season_end").isNotNull())
                                 .and(col("salary").isNotNull())
-                                .and(col("salary").gt(0))));
+                                .and(col("salary").gt(0))).groupBy("player_id", "season_end")
+                .agg(sum(col("salary")).as("salary"));
 
         // P6: J2 + uniqueness assert + метрика.
         Dataset<Row> joined = JoinAndMetric.join(stats, salaries).cache();

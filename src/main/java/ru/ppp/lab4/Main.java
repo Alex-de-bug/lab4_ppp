@@ -24,7 +24,7 @@ import static org.apache.spark.sql.functions.row_number;
  */
 public final class Main {
 
-    private static final int SEASON = 1991;
+    private static final int SEASON = 2010;
     private static final int TOP_LIMIT = 10;
     private static final int UNDERVALUED_LIMIT = 5;
 
@@ -113,7 +113,7 @@ public final class Main {
                 .orderBy(col("efficiency").asc(), col("player_id").asc())
                 .limit(UNDERVALUED_LIMIT);
         System.out.println("Топ " + UNDERVALUED_LIMIT + " недооценённых, сезон " + SEASON);
-        printRows(result.collectAsList(), UNDERVALUED_LIMIT);
+        result.show(UNDERVALUED_LIMIT, false);
     }
 
     private static void printRows(List<Row> rows, int requested) {
